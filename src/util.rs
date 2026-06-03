@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -25,7 +26,24 @@ pub fn normalize_path(path: &Path) -> String {
 pub fn find_repo_root(cwd: &str) -> Option<String> {
     let mut current = PathBuf::from(cwd);
     loop {
-        if current.join(".git").exists() {
+        let git_path = current.join(".git");
+        if git_path.exists() {
+            // .git is a file in git worktrees — resolve to the actual repo root
+            if git_path.is_file() {
+                if let Ok(content) = fs::read_to_string(&git_path) {
+                    if let Some(gitdir) = content.trim().strip_prefix("gitdir: ") {
+                        // gitdir is e.g. /repo/.git/worktrees/<name>; go up 3 levels
+                        let resolved = PathBuf::from(gitdir)
+                            .parent()
+                            .and_then(|p| p.parent())
+                            .and_then(|p| p.parent())
+                            .map(|p| p.to_string_lossy().to_string());
+                        if resolved.is_some() {
+                            return resolved;
+                        }
+                    }
+                }
+            }
             return Some(current.to_string_lossy().to_string());
         }
         if !current.pop() {
@@ -423,5 +441,25 @@ mod tests {
     fn highlights_matches() {
         let value = highlight_matches("alpha beta gamma", "beta");
         assert!(value.contains("[[beta]]"));
+    }
+
+    #[test]
+    fn find_repo_root_resolves_worktree_to_main_repo() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let main_repo = dir.path().join("myrepo");
+        let worktree = dir.path().join("myrepo").join(".git").join("worktrees").join("wt");
+        let wt_dir = dir.path().join("wt");
+        fs::create_dir_all(&main_repo).unwrap();
+        fs::create_dir_all(&main_repo.join(".git")).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(&wt_dir).unwrap();
+        // Write worktree .git file pointing back to main repo's worktrees entry
+        fs::write(
+            wt_dir.join(".git"),
+            format!("gitdir: {}", worktree.display()),
+        ).unwrap();
+        let root = find_repo_root(wt_dir.to_str().unwrap());
+        assert_eq!(root.as_deref(), Some(main_repo.to_str().unwrap()));
     }
 }
