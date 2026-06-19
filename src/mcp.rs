@@ -179,7 +179,7 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                 },
                 {
                     "name": "get_resume_command",
-                    "description": "Get the CLI command needed to resume a specific session in its native tool (Claude Code, Codex, or Pi). Cursor transcript resume is not currently supported.",
+                    "description": "Get the CLI command needed to resume a specific session in its native tool (Claude Code, Codex, or Pi). Cursor and Antigravity resume are not currently supported.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {

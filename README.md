@@ -155,7 +155,7 @@ prefer_current_repo = true
 
 ## Limitations
 
-- Resume delegates to the native provider CLI (`claude --resume <id>`, `codex resume <id>`, or `pi --session <id>`). Cursor transcript resume is not currently supported.
+- Resume delegates to the native provider CLI (`claude --resume <id>`, `codex resume <id>`, or `pi --session <id>`). Cursor and Antigravity resume are not currently supported.
 - Claude, Cursor, and Pi subagent transcripts are excluded from indexing to avoid duplicate records.
 
 ## Status

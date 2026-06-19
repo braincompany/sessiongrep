@@ -205,14 +205,17 @@ impl PiAdapter {
     }
 }
 
-/// A session file is "top level" when it sits directly inside a project directory:
-/// `<root>/<encoded-cwd>/<file>.jsonl`. Subagent transcripts live further down the
-/// tree and are excluded so they don't duplicate the parent session.
+/// A session file is "top level" when it sits at most one directory below the
+/// configured root. With the default root (`~/.pi/agent/sessions`) that's
+/// `<root>/<encoded-cwd>/<file>.jsonl` (depth 2); if a user points a root at a
+/// specific project directory the session files sit directly in it (depth 1).
+/// Subagent transcripts live further down the tree (`<session>/<agent>/run-N/
+/// session.jsonl`) and are excluded so they don't duplicate the parent session.
 fn is_top_level_session(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return false;
     };
-    relative.components().count() == 2
+    matches!(relative.components().count(), 1 | 2)
 }
 
 #[cfg(test)]
@@ -298,5 +301,34 @@ mod tests {
         let parsed = adapter.parse(&sources[0]);
         assert_eq!(parsed.session.provider_session_id, session_id);
         assert_eq!(parsed.session.id, format!("pi:{session_id}"));
+    }
+
+    #[test]
+    fn discovers_sessions_when_root_is_a_project_directory() {
+        let temp = tempdir().expect("tempdir");
+        // Root points directly at a single project's session dir, so transcripts
+        // sit one level below the root instead of two.
+        let root = temp.path().join("--Users-nisarg-src-demo--");
+        fs::create_dir_all(&root).unwrap();
+
+        let session_id = "019edbc9-83df-72a0-a95b-64e6d810ad75";
+        let transcript_path = root.join(format!("2026-06-18T17-31-17-343Z_{session_id}.jsonl"));
+        fs::write(
+            &transcript_path,
+            r#"{"type":"session","version":3,"id":"019edbc9-83df-72a0-a95b-64e6d810ad75","timestamp":"2026-06-18T17:31:17.343Z","cwd":"/Users/nisarg/src/demo"}
+{"type":"message","id":"4abe1450","timestamp":"2026-06-18T17:31:32.922Z","message":{"role":"user","content":[{"type":"text","text":"Add pi support"}]}}
+"#,
+        )
+        .unwrap();
+
+        // Subagent transcript nested below the project root — still excluded.
+        let nested = root.join("agent01").join("run-0");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("session.jsonl"), "{}\n").unwrap();
+
+        let adapter = PiAdapter::new(vec![root]);
+        let sources = adapter.discover();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].path, transcript_path);
     }
 }
