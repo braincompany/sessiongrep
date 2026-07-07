@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
+use sessiongrep::safety::find_poisoned_sessions;
 use sessiongrep::config::Config;
 use sessiongrep::db::Db;
 use sessiongrep::indexer;
@@ -428,8 +429,24 @@ fn print_doctor(config: &Config, db: &Db) -> Result<()> {
     ];
     let counts = db.counts_by_provider()?;
     let warnings = db.count_parse_warnings()?;
+    let poison_scan_limit = 500usize;
+    let poison_hits = find_poisoned_sessions(
+        &db.load_all_sessions(poison_scan_limit).unwrap_or_default(),
+        5,
+    );
     println!("DB: {}", config.db_path().display());
     println!("Parse warnings indexed: {warnings}");
+    println!(
+        "Poisoned context warnings: {} (scanned up to {poison_scan_limit} sessions)",
+        poison_hits.len()
+    );
+    for hit in &poison_hits {
+        let signal_ids: Vec<_> = hit.signals.iter().map(|s| s.pattern_id).collect();
+        println!(
+            "  - {} [{}] signals={:?} snippet={}",
+            hit.session_id, hit.provider, signal_ids, hit.snippet
+        );
+    }
     for item in health {
         println!("\nProvider: {}", item.provider);
         println!(

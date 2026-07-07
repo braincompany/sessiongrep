@@ -108,6 +108,9 @@ The agent will call `search_sessions` to find matches and `get_session` to pull 
 | `get_session` | Get full transcript and metadata by session ID (supports `max_lines` to limit context) |
 | `list_sessions` | List recent sessions, filterable by provider and path prefix |
 | `get_resume_command` | Get the CLI command to resume a session in its native tool |
+| `timeline_for_repo` | Sessions for a repo/cwd prefix, grouped by day |
+| `summarize_session` | Bounded local summary (no cloud LLM) |
+| `diff_sessions` | Metadata + transcript line diff between two sessions |
 
 ## Config
 
@@ -156,6 +159,7 @@ prefer_current_repo = true
 ## Limitations
 
 - Resume delegates to the native provider CLI (`claude --resume <id>`, `codex resume <id>`, or `pi --session <id>`). Cursor and Antigravity resume are not currently supported.
+- `sessiongrep doctor` scans indexed transcripts for prompt-injection heuristics; treat flagged sessions as untrusted before MCP recall.
 - Claude, Cursor, and Pi subagent transcripts are excluded from indexing to avoid duplicate records.
 
 ## Status

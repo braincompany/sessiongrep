@@ -485,6 +485,20 @@ impl Db {
             .map_err(Into::into)
     }
 
+    pub fn load_all_sessions(&self, limit: usize) -> Result<Vec<SessionWithTranscript>> {
+        let filters = SearchFilters {
+            provider: None,
+            path_prefix: None,
+            since: None,
+            limit,
+            warnings_only: false,
+        };
+        let mut sessions = self.load_sessions(&filters)?;
+        sessions.sort_by(|a, b| b.session.updated_at.cmp(&a.session.updated_at));
+        sessions.truncate(limit);
+        Ok(sessions)
+    }
+
     pub fn counts_by_provider(&self) -> Result<HashMap<String, i64>> {
         let mut stmt = self
             .conn

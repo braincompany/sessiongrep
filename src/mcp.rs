@@ -8,6 +8,11 @@ use sessiongrep::config::Config;
 use sessiongrep::db::Db;
 use sessiongrep::indexer;
 use sessiongrep::models::{Provider, SearchFilters};
+use sessiongrep::safety::find_poisoned_sessions;
+use sessiongrep::session_ops::{
+    build_repo_timeline, diff_sessions, format_diff, format_summary, format_timeline,
+    summarize_session,
+};
 use sessiongrep::util::{current_repo, resume_plan, truncate_for_display};
 
 /// Minimum gap between incremental reindexes triggered by MCP tool calls.
@@ -190,6 +195,62 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                         },
                         "required": ["session_id"]
                     }
+                },
+                {
+                    "name": "timeline_for_repo",
+                    "description": "List indexed sessions for a repository or working-directory prefix, grouped by day and sorted by recency. Use this to see what agent work happened on a repo over time.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "repo_prefix": {
+                                "type": "string",
+                                "description": "Repository root or cwd path prefix (e.g. '/Users/me/projects/myapp')"
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Max sessions to include (default 30)",
+                                "default": 30
+                            }
+                        },
+                        "required": ["repo_prefix"]
+                    }
+                },
+                {
+                    "name": "summarize_session",
+                    "description": "Produce a bounded local summary of a session (title, intents, line counts) without calling a cloud LLM.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": {
+                                "type": "string",
+                                "description": "Session ID or unique prefix"
+                            }
+                        },
+                        "required": ["session_id"]
+                    }
+                },
+                {
+                    "name": "diff_sessions",
+                    "description": "Compare two sessions: metadata changes plus transcript lines unique to each session (capped).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_id_a": {
+                                "type": "string",
+                                "description": "First session ID or prefix"
+                            },
+                            "session_id_b": {
+                                "type": "string",
+                                "description": "Second session ID or prefix"
+                            },
+                            "max_unique_lines": {
+                                "type": "integer",
+                                "description": "Max unique lines per side (default 20)",
+                                "default": 20
+                            }
+                        },
+                        "required": ["session_id_a", "session_id_b"]
+                    }
                 }
             ]
         }
@@ -208,6 +269,9 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
         "get_session" => tool_get_session(&args, db),
         "list_sessions" => tool_list_sessions(&args, db),
         "get_resume_command" => tool_get_resume_command(&args, db),
+        "timeline_for_repo" => tool_timeline_for_repo(&args, db),
+        "summarize_session" => tool_summarize_session(&args, db),
+        "diff_sessions" => tool_diff_sessions(&args, db),
         _ => Err(format!("unknown tool: {tool_name}")),
     };
 
@@ -405,4 +469,51 @@ fn tool_get_resume_command(args: &Value, db: &Db) -> Result<String, String> {
         }
         None => Ok(cmd_str),
     }
+}
+
+fn tool_timeline_for_repo(args: &Value, db: &Db) -> Result<String, String> {
+    let repo_prefix = args
+        .get("repo_prefix")
+        .and_then(Value::as_str)
+        .ok_or("missing required parameter: repo_prefix")?;
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(30) as usize;
+
+    let sessions = db.load_all_sessions(limit * 3).map_err(|e| e.to_string())?;
+    let records: Vec<_> = sessions.into_iter().map(|s| s.session).collect();
+    let days = build_repo_timeline(&records, repo_prefix, limit);
+    Ok(format_timeline(repo_prefix, &days))
+}
+
+fn tool_summarize_session(args: &Value, db: &Db) -> Result<String, String> {
+    let session_id = args
+        .get("session_id")
+        .and_then(Value::as_str)
+        .ok_or("missing required parameter: session_id")?;
+
+    let full = db.resolve_session(session_id).map_err(|e| e.to_string())?;
+    let summary = summarize_session(&full, 200);
+    Ok(format_summary(&summary))
+}
+
+fn tool_diff_sessions(args: &Value, db: &Db) -> Result<String, String> {
+    let session_id_a = args
+        .get("session_id_a")
+        .and_then(Value::as_str)
+        .ok_or("missing required parameter: session_id_a")?;
+    let session_id_b = args
+        .get("session_id_b")
+        .and_then(Value::as_str)
+        .ok_or("missing required parameter: session_id_b")?;
+    let max_unique_lines = args
+        .get("max_unique_lines")
+        .and_then(Value::as_u64)
+        .unwrap_or(20) as usize;
+
+    let a = db.resolve_session(session_id_a).map_err(|e| e.to_string())?;
+    let b = db.resolve_session(session_id_b).map_err(|e| e.to_string())?;
+    let diff = diff_sessions(&a, &b, max_unique_lines);
+    Ok(format_diff(&diff))
 }
