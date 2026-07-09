@@ -8,6 +8,7 @@ use sessiongrep::config::Config;
 use sessiongrep::db::Db;
 use sessiongrep::indexer;
 use sessiongrep::models::{Provider, SearchFilters};
+use sessiongrep::timeline;
 use sessiongrep::util::{current_repo, resume_plan, truncate_for_display};
 
 /// Minimum gap between incremental reindexes triggered by MCP tool calls.
@@ -178,6 +179,25 @@ fn handle_tools_list(id: Option<Value>) -> Value {
                     }
                 },
                 {
+                    "name": "timeline_for_repo",
+                    "description": "Day-bucketed view of sessions for a repo path prefix — a named affordance for \"what changed over time?\" in this codebase. Returns metadata only (no transcripts), grouped by UTC calendar day.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "repo_prefix": {
+                                "type": "string",
+                                "description": "Repo or working-directory path prefix (matches cwd or repo_root, case-insensitive)"
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Max sessions to include (default 30, max 200)",
+                                "default": 30
+                            }
+                        },
+                        "required": ["repo_prefix"]
+                    }
+                },
+                {
                     "name": "get_resume_command",
                     "description": "Get the CLI command needed to resume a specific session in its native tool (Claude Code, Codex, or Pi). Cursor and Antigravity resume are not currently supported.",
                     "inputSchema": {
@@ -207,6 +227,7 @@ fn handle_tools_call(id: Option<Value>, params: &Value, config: &Config, db: &Db
         "search_sessions" => tool_search_sessions(&args, config, db),
         "get_session" => tool_get_session(&args, db),
         "list_sessions" => tool_list_sessions(&args, db),
+        "timeline_for_repo" => tool_timeline_for_repo(&args, db),
         "get_resume_command" => tool_get_resume_command(&args, db),
         _ => Err(format!("unknown tool: {tool_name}")),
     };
@@ -386,6 +407,24 @@ fn tool_list_sessions(args: &Value, db: &Db) -> Result<String, String> {
     Ok(out)
 }
 
+fn tool_timeline_for_repo(args: &Value, db: &Db) -> Result<String, String> {
+    let repo_prefix = args
+        .get("repo_prefix")
+        .and_then(Value::as_str)
+        .ok_or("missing required parameter: repo_prefix")?;
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize)
+        .unwrap_or(timeline::DEFAULT_LIMIT);
+    let limit = timeline::clamp_limit(limit);
+
+    let sessions = db
+        .list_session_records_for_repo_prefix(repo_prefix, limit)
+        .map_err(|e| e.to_string())?;
+    Ok(timeline::build_repo_timeline(sessions, repo_prefix, limit))
+}
+
 fn tool_get_resume_command(args: &Value, db: &Db) -> Result<String, String> {
     let session_id = args
         .get("session_id")
@@ -404,5 +443,23 @@ fn tool_get_resume_command(args: &Value, db: &Db) -> Result<String, String> {
             Ok(format!("cd {quoted} && {cmd_str}"))
         }
         None => Ok(cmd_str),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tools_list_includes_timeline_for_repo() {
+        let response = handle_tools_list(None);
+        let tools = response["result"]["tools"]
+            .as_array()
+            .expect("tools array");
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(names.contains(&"timeline_for_repo"));
     }
 }

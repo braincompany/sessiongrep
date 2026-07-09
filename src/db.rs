@@ -249,6 +249,34 @@ impl Db {
         Ok(results.into_iter().map(|item| item.session).collect())
     }
 
+    /// Load session metadata only (no transcript join) for a repo path prefix.
+    /// Prefix matching is ASCII case-insensitive on `cwd` and `repo_root`.
+    pub fn list_session_records_for_repo_prefix(
+        &self,
+        repo_prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionRecord>> {
+        let pattern = format!("{}%", repo_prefix.to_ascii_lowercase());
+        let sql = "
+            select
+                s.id, s.provider, s.provider_session_id, s.title, s.summary, s.cwd, s.repo_root,
+                s.created_at, s.updated_at, s.last_message_at, s.preview_text, s.source_path,
+                s.message_count, s.parse_version, s.raw_metadata_json, s.parse_warning, s.discovery_source
+            from sessions s
+            where lower(coalesce(s.cwd, '')) like ?
+               or lower(coalesce(s.repo_root, '')) like ?
+            order by coalesce(s.updated_at, s.created_at, '') desc, s.id asc
+            limit ?
+        ";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![pattern, pattern, limit as i64], row_to_session_record)?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
     pub fn search(
         &self,
         query: &str,
@@ -544,6 +572,40 @@ impl Db {
         }
         Ok(results)
     }
+}
+
+fn row_to_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
+    let provider: String = row.get(1)?;
+    Ok(SessionRecord {
+        id: row.get(0)?,
+        provider: provider
+            .parse()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        provider_session_id: row.get(2)?,
+        title: row.get(3)?,
+        summary: row.get(4)?,
+        cwd: row.get(5)?,
+        repo_root: row.get(6)?,
+        created_at: row
+            .get::<_, Option<String>>(7)?
+            .as_deref()
+            .and_then(crate::util::parse_datetime),
+        updated_at: row
+            .get::<_, Option<String>>(8)?
+            .as_deref()
+            .and_then(crate::util::parse_datetime),
+        last_message_at: row
+            .get::<_, Option<String>>(9)?
+            .as_deref()
+            .and_then(crate::util::parse_datetime),
+        preview_text: row.get(10)?,
+        source_path: row.get(11)?,
+        message_count: row.get(12)?,
+        parse_version: row.get(13)?,
+        raw_metadata_json: row.get(14)?,
+        parse_warning: row.get(15)?,
+        discovery_source: row.get(16)?,
+    })
 }
 
 fn row_to_session_with_transcript(

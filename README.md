@@ -107,6 +107,7 @@ The agent will call `search_sessions` to find matches and `get_session` to pull 
 | `search_sessions` | Search sessions by keyword, with optional provider filter and limit |
 | `get_session` | Get full transcript and metadata by session ID (supports `max_lines` to limit context) |
 | `list_sessions` | List recent sessions, filterable by provider and path prefix |
+| `timeline_for_repo` | Day-bucketed metadata timeline for a repo path prefix — scoped view of what changed over time |
 | `get_resume_command` | Get the CLI command to resume a session in its native tool |
 
 ## Config

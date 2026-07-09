@@ -3,4 +3,5 @@ pub mod db;
 pub mod indexer;
 pub mod models;
 pub mod providers;
+pub mod timeline;
 pub mod util;
