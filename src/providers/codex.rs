@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -7,7 +8,7 @@ use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
 use regex::Regex;
 use rusqlite::Connection;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::models::{ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
@@ -80,6 +81,16 @@ impl CodexAdapter {
             }
         }
         files
+    }
+
+    pub fn durable_ids(&self) -> HashSet<String> {
+        let mut ids: HashSet<String> = self.threads.keys().cloned().collect();
+        for source in self.discover() {
+            if let Some(id) = self.extract_id(&source.path) {
+                ids.insert(id);
+            }
+        }
+        ids
     }
 
     pub fn parse(&self, source: &SourceFile) -> ParsedSession {
@@ -280,4 +291,3 @@ fn load_index_titles(path: &Path) -> Result<HashMap<String, String>> {
     }
     Ok(map)
 }
-

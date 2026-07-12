@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Utc};
 use regex::RegexBuilder;
 use serde_json::Value;
@@ -290,13 +290,15 @@ pub fn highlight_matches(value: &str, query: &str) -> String {
     let stopwords = [
         "a", "an", "and", "are", "as", "at", "based", "be", "but", "by", "can", "check", "do",
         "double", "for", "from", "has", "have", "how", "i", "in", "into", "is", "it", "made",
-        "not", "of", "on", "or", "please", "some", "that", "the", "this", "to", "update",
-        "what", "with", "you", "your",
+        "not", "of", "on", "or", "please", "some", "that", "the", "this", "to", "update", "what",
+        "with", "you", "your",
     ];
     for token in trimmed.split_whitespace() {
         if token.len() >= 3
             && !stopwords.contains(&token.to_ascii_lowercase().as_str())
-            && !terms.iter().any(|existing| existing.eq_ignore_ascii_case(token))
+            && !terms
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(token))
         {
             terms.push(token.to_string());
         }
@@ -326,11 +328,7 @@ pub fn format_transcript_line(role: &str, timestamp: Option<DateTime<Utc>>, text
     format!("[{stamp}] {role}\n{text}")
 }
 
-pub fn minimal_record(
-    provider: Provider,
-    path: &Path,
-    warning: String,
-) -> ParsedSession {
+pub fn minimal_record(provider: Provider, path: &Path, warning: String) -> ParsedSession {
     let provider_session_id = path
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -379,6 +377,11 @@ pub fn current_repo(config: &Config) -> Option<String> {
 }
 
 pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<String>)> {
+    if session.discovery_source == "logs-sqlite" {
+        return Err(anyhow!(
+            "logs-derived Codex sessions are lossy diagnostic recovery and cannot be resumed"
+        ));
+    }
     let binary = match session.provider {
         Provider::Claude => "claude",
         Provider::Codex => "codex",
@@ -413,7 +416,9 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
             "--session".to_string(),
             session.provider_session_id.clone(),
         ],
-        Provider::Cursor | Provider::Antigravity => unreachable!("resume is handled before command construction"),
+        Provider::Cursor | Provider::Antigravity => {
+            unreachable!("resume is handled before command construction")
+        }
     };
     Ok((command, cwd))
 }
@@ -472,7 +477,11 @@ mod tests {
         fs::create_dir_all(&main_repo.join(".git")).unwrap();
         fs::create_dir_all(&worktree_gitdir).unwrap();
         fs::create_dir_all(&wt_dir).unwrap();
-        fs::write(wt_dir.join(".git"), format!("gitdir: {}", worktree_gitdir.display())).unwrap();
+        fs::write(
+            wt_dir.join(".git"),
+            format!("gitdir: {}", worktree_gitdir.display()),
+        )
+        .unwrap();
         let root = find_repo_root(wt_dir.to_str().unwrap());
         assert_eq!(root.as_deref(), Some(main_repo.to_str().unwrap()));
     }
@@ -483,13 +492,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let super_repo = dir.path().join("superrepo");
         let submodule_dir = super_repo.join("packages").join("foo");
-        let submodule_gitdir = super_repo.join(".git").join("modules").join("packages").join("foo");
+        let submodule_gitdir = super_repo
+            .join(".git")
+            .join("modules")
+            .join("packages")
+            .join("foo");
         fs::create_dir_all(&super_repo).unwrap();
         fs::create_dir_all(&super_repo.join(".git")).unwrap();
         fs::create_dir_all(&submodule_dir).unwrap();
         fs::create_dir_all(&submodule_gitdir).unwrap();
         // Submodule .git file points into <super>/.git/modules/...
-        fs::write(submodule_dir.join(".git"), format!("gitdir: {}", submodule_gitdir.display())).unwrap();
+        fs::write(
+            submodule_dir.join(".git"),
+            format!("gitdir: {}", submodule_gitdir.display()),
+        )
+        .unwrap();
         // Should resolve to the submodule's own directory (falls through worktree logic)
         // rather than some garbage path 3 levels above the modules entry
         let root = find_repo_root(submodule_dir.to_str().unwrap());

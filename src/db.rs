@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
-use rusqlite::{Connection, OptionalExtension, params};
+use fuzzy_matcher::FuzzyMatcher;
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::models::{
     ParsedSession, Provider, SearchFilters, SearchHit, SessionRecord, SessionWithTranscript,
@@ -81,8 +81,7 @@ impl Db {
             )
             .optional()?;
         if fts_sql.as_ref().is_some_and(|sql| sql.contains("content=")) {
-            self.conn
-                .execute_batch("drop table sessions_fts")?;
+            self.conn.execute_batch("drop table sessions_fts")?;
         }
         self.conn.execute_batch(
             "create virtual table if not exists sessions_fts using fts5(
@@ -93,9 +92,9 @@ impl Db {
         let sessions_count: i64 =
             self.conn
                 .query_row("select count(*) from sessions", [], |row| row.get(0))?;
-        let fts_count: i64 = self
-            .conn
-            .query_row("select count(*) from sessions_fts", [], |row| row.get(0))?;
+        let fts_count: i64 =
+            self.conn
+                .query_row("select count(*) from sessions_fts", [], |row| row.get(0))?;
         if sessions_count > 0 && fts_count == 0 {
             self.conn.execute(
                 "insert into sessions_fts (rowid, title, summary, preview_text, transcript_text)
@@ -120,7 +119,6 @@ impl Db {
         Ok(())
     }
 
-
     pub fn is_file_current(
         &self,
         provider: Provider,
@@ -139,6 +137,33 @@ impl Db {
         Ok(
             matches!(result, Some((stored_mtime, stored_size)) if stored_mtime == mtime_ns && stored_size == size),
         )
+    }
+
+    pub fn source_cursor(&self, provider: Provider, path: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "select content_hash from files_seen where provider = ?1 and source_path = ?2",
+                params![provider.as_str(), path],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .and_then(|value| {
+                value
+                    .strip_prefix("codex-logs-v1:max-id=")
+                    .and_then(|v| v.parse().ok())
+            }))
+    }
+
+    pub fn mark_source_cursor(&self, provider: Provider, path: &str, max_id: i64) -> Result<()> {
+        self.conn.execute(
+            "insert into files_seen(provider,source_path,mtime_ns,size_bytes,last_indexed_at,content_hash)
+             values(?1,?2,0,0,?3,?4) on conflict(provider,source_path) do update set
+             last_indexed_at=excluded.last_indexed_at, content_hash=excluded.content_hash",
+            params![provider.as_str(), path, Utc::now().to_rfc3339(), format!("codex-logs-v1:max-id={max_id}")],
+        )?;
+        Ok(())
     }
 
     pub fn upsert_session(

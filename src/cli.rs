@@ -2,23 +2,23 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
+use crate::tui;
 use sessiongrep::config::Config;
 use sessiongrep::db::Db;
 use sessiongrep::indexer;
 use sessiongrep::models::{Provider, ProviderHealth, SearchFilters, SessionRecord};
 use sessiongrep::providers::{
-    claude::ClaudeAdapter, codex::CodexAdapter, cursor::CursorAdapter, antigravity::AntigravityAdapter,
-    pi::PiAdapter,
+    antigravity::AntigravityAdapter, claude::ClaudeAdapter, codex::CodexAdapter,
+    codex_logs::CodexLogsAdapter, cursor::CursorAdapter, pi::PiAdapter,
 };
 use sessiongrep::util::{
     current_repo, highlight_matches, normalize_path, parse_datetime, prompt_confirm, relative_age,
     render_command, resume_plan, truncate_for_display, which,
 };
-use crate::tui;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -110,7 +110,7 @@ pub fn run() -> Result<()> {
     match cli.command {
         Commands::Reindex(args) => {
             let (seen, updated) = reindex(&config, &db, args.full, false)?;
-            println!("reindex complete: scanned {seen} files, updated {updated} sessions");
+            println!("reindex complete: scanned {seen} sources, updated {updated} sessions");
         }
         Commands::List(args) => {
             let filters = build_filters(&args, &config)?;
@@ -328,8 +328,10 @@ fn print_session_detail(session: &SessionRecord) {
     }
 }
 
-
-fn export_session(session: &sessiongrep::models::SessionWithTranscript, format: &str) -> Result<String> {
+fn export_session(
+    session: &sessiongrep::models::SessionWithTranscript,
+    format: &str,
+) -> Result<String> {
     match format {
         "text" => Ok(format!(
             "{}\n\n{}\n",
@@ -430,6 +432,23 @@ fn print_doctor(config: &Config, db: &Db) -> Result<()> {
     let warnings = db.count_parse_warnings()?;
     println!("DB: {}", config.db_path().display());
     println!("Parse warnings indexed: {warnings}");
+    match CodexLogsAdapter::new(&config.codex_home()).recover(&codex_adapter.durable_ids()) {
+        Ok((_, log_health)) => {
+            println!("Codex log DB: {}", log_health.status);
+            println!(
+                "  recoverable project side chats: {}",
+                log_health.recoverable
+            );
+            println!(
+                "  retention-limit threads: {}",
+                log_health.retention_limited
+            );
+            println!("  parse failures: {}", log_health.parse_failures);
+            println!("  content unavailable: {}", log_health.content_unavailable);
+            println!("  max row ID: {}", log_health.max_row_id);
+        }
+        Err(err) => println!("Codex log DB: unavailable (optional): {err:#}"),
+    }
     for item in health {
         println!("\nProvider: {}", item.provider);
         println!(
@@ -505,4 +524,3 @@ fn print_paths(config: &Config) {
     );
     println!("Codex metadata home: {}", config.codex_home().display());
 }
-

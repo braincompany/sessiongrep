@@ -5,7 +5,7 @@ use crate::db::Db;
 use crate::models::Provider;
 use crate::providers::{
     antigravity::AntigravityAdapter, claude::ClaudeAdapter, codex::CodexAdapter,
-    cursor::CursorAdapter, pi::PiAdapter,
+    codex_logs::CodexLogsAdapter, cursor::CursorAdapter, pi::PiAdapter,
 };
 use crate::util::normalize_path;
 
@@ -81,5 +81,28 @@ pub fn reindex(
         }
     }
 
-    Ok((total, updated))
+    if config.providers.codex.enabled {
+        let logs = CodexLogsAdapter::new(&config.codex_home());
+        let source_path = logs.source_path();
+        let current_max = logs.max_row_id();
+        let unchanged = matches!(current_max.as_ref(), Ok(Some(max)) if !full && db.source_cursor(Provider::Codex, &source_path)? == Some(*max));
+        if !unchanged {
+            match logs.recover(&codex.durable_ids()) {
+                Ok((sessions, _health)) => {
+                    for parsed in sessions {
+                        db.upsert_session(&parsed, 0, 0)?;
+                        updated += 1;
+                    }
+                    if let Ok(Some(max)) = current_max {
+                        db.mark_source_cursor(Provider::Codex, &source_path, max)?;
+                    }
+                }
+                Err(err) => {
+                    eprintln!("sessiongrep: optional Codex logs source unavailable: {err:#}")
+                }
+            }
+        }
+    }
+
+    Ok((total + usize::from(config.providers.codex.enabled), updated))
 }

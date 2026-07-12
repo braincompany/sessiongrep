@@ -91,11 +91,17 @@ impl Default for Config {
                 },
                 antigravity: ProviderConfig {
                     enabled: true,
-                    paths: vec![home.join(".gemini/antigravity/brain").to_string_lossy().to_string()],
+                    paths: vec![home
+                        .join(".gemini/antigravity/brain")
+                        .to_string_lossy()
+                        .to_string()],
                 },
                 pi: ProviderConfig {
                     enabled: true,
-                    paths: vec![home.join(".pi/agent/sessions").to_string_lossy().to_string()],
+                    paths: vec![home
+                        .join(".pi/agent/sessions")
+                        .to_string_lossy()
+                        .to_string()],
                 },
             },
             index: IndexConfig {
@@ -259,8 +265,12 @@ impl Config {
     }
 
     pub fn codex_home(&self) -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("~"))
-            .join(".codex")
+        std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("~"))
+                    .join(".codex")
+            })
     }
 }

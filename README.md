@@ -156,6 +156,7 @@ prefer_current_repo = true
 ## Limitations
 
 - Resume delegates to the native provider CLI (`claude --resume <id>`, `codex resume <id>`, or `pi --session <id>`). Cursor and Antigravity resume are not currently supported.
+- Codex Desktop project side chats may be recovered best-effort from `CODEX_HOME/logs_2.sqlite`. This diagnostic source is lossy, retention-limited, and not resumable; durable rollout/state sessions always take precedence.
 - Claude, Cursor, and Pi subagent transcripts are excluded from indexing to avoid duplicate records.
 
 ## Status
