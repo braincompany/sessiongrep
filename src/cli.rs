@@ -2,23 +2,23 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
-use crate::tui;
 use sessiongrep::config::Config;
 use sessiongrep::db::Db;
 use sessiongrep::indexer;
 use sessiongrep::models::{Provider, ProviderHealth, SearchFilters, SessionRecord};
 use sessiongrep::providers::{
-    antigravity::AntigravityAdapter, claude::ClaudeAdapter, codex::CodexAdapter,
-    codex_logs::CodexLogsAdapter, cursor::CursorAdapter, pi::PiAdapter,
+    claude::ClaudeAdapter, codex::CodexAdapter, codex_logs::CodexLogsAdapter,
+    cursor::CursorAdapter, antigravity::AntigravityAdapter, pi::PiAdapter,
 };
 use sessiongrep::util::{
     current_repo, highlight_matches, normalize_path, parse_datetime, prompt_confirm, relative_age,
     render_command, resume_plan, truncate_for_display, which,
 };
+use crate::tui;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -328,10 +328,8 @@ fn print_session_detail(session: &SessionRecord) {
     }
 }
 
-fn export_session(
-    session: &sessiongrep::models::SessionWithTranscript,
-    format: &str,
-) -> Result<String> {
+
+fn export_session(session: &sessiongrep::models::SessionWithTranscript, format: &str) -> Result<String> {
     match format {
         "text" => Ok(format!(
             "{}\n\n{}\n",
@@ -432,8 +430,11 @@ fn print_doctor(config: &Config, db: &Db) -> Result<()> {
     let warnings = db.count_parse_warnings()?;
     println!("DB: {}", config.db_path().display());
     println!("Parse warnings indexed: {warnings}");
-    match CodexLogsAdapter::new(&config.codex_home()).recover(&codex_adapter.durable_ids()) {
-        Ok((_, log_health)) => {
+    match CodexLogsAdapter::new(&config.codex_home())
+        .recover(&codex_adapter.durable_ids(), None)
+    {
+        Ok(recovery) => {
+            let log_health = recovery.health;
             println!("Codex log DB: {}", log_health.status);
             println!(
                 "  recoverable project side chats: {}",

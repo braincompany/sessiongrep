@@ -1,12 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
-use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use rusqlite::{params, Connection, OptionalExtension};
+use fuzzy_matcher::skim::SkimMatcherV2;
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::models::{
     ParsedSession, Provider, SearchFilters, SearchHit, SessionRecord, SessionWithTranscript,
@@ -15,6 +15,17 @@ use crate::util::snippet_from_match;
 
 pub struct Db {
     conn: Connection,
+}
+
+pub struct SourceScanCommit<'a> {
+    pub provider: Provider,
+    pub checkpoint_path: &'a str,
+    pub discovery_source: &'a str,
+    pub checkpoint: Option<&'a str>,
+    pub replace_all: bool,
+    pub affected_provider_ids: &'a [String],
+    pub durable_provider_ids: &'a HashSet<String>,
+    pub sessions: &'a [ParsedSession],
 }
 
 impl Db {
@@ -81,7 +92,8 @@ impl Db {
             )
             .optional()?;
         if fts_sql.as_ref().is_some_and(|sql| sql.contains("content=")) {
-            self.conn.execute_batch("drop table sessions_fts")?;
+            self.conn
+                .execute_batch("drop table sessions_fts")?;
         }
         self.conn.execute_batch(
             "create virtual table if not exists sessions_fts using fts5(
@@ -92,9 +104,9 @@ impl Db {
         let sessions_count: i64 =
             self.conn
                 .query_row("select count(*) from sessions", [], |row| row.get(0))?;
-        let fts_count: i64 =
-            self.conn
-                .query_row("select count(*) from sessions_fts", [], |row| row.get(0))?;
+        let fts_count: i64 = self
+            .conn
+            .query_row("select count(*) from sessions_fts", [], |row| row.get(0))?;
         if sessions_count > 0 && fts_count == 0 {
             self.conn.execute(
                 "insert into sessions_fts (rowid, title, summary, preview_text, transcript_text)
@@ -119,6 +131,7 @@ impl Db {
         Ok(())
     }
 
+
     pub fn is_file_current(
         &self,
         provider: Provider,
@@ -139,7 +152,7 @@ impl Db {
         )
     }
 
-    pub fn source_cursor(&self, provider: Provider, path: &str) -> Result<Option<i64>> {
+    pub fn source_checkpoint(&self, provider: Provider, path: &str) -> Result<Option<String>> {
         Ok(self
             .conn
             .query_row(
@@ -148,21 +161,64 @@ impl Db {
                 |row| row.get::<_, Option<String>>(0),
             )
             .optional()?
-            .flatten()
-            .and_then(|value| {
-                value
-                    .strip_prefix("codex-logs-v1:max-id=")
-                    .and_then(|v| v.parse().ok())
-            }))
+            .flatten())
     }
 
-    pub fn mark_source_cursor(&self, provider: Provider, path: &str, max_id: i64) -> Result<()> {
-        self.conn.execute(
-            "insert into files_seen(provider,source_path,mtime_ns,size_bytes,last_indexed_at,content_hash)
-             values(?1,?2,0,0,?3,?4) on conflict(provider,source_path) do update set
-             last_indexed_at=excluded.last_indexed_at, content_hash=excluded.content_hash",
-            params![provider.as_str(), path, Utc::now().to_rfc3339(), format!("codex-logs-v1:max-id={max_id}")],
+    pub fn discovered_provider_ids(
+        &self,
+        provider: Provider,
+        discovery_source: &str,
+    ) -> Result<HashSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "select provider_session_id from sessions
+             where provider = ?1 and discovery_source = ?2",
         )?;
+        let rows = stmt.query_map(params![provider.as_str(), discovery_source], |row| {
+            row.get(0)
+        })?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
+    pub fn commit_source_scan(&self, scan: SourceScanCommit<'_>) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        if scan.replace_all {
+            delete_discovered_sessions(&tx, scan.provider, scan.discovery_source)?;
+        } else {
+            for provider_id in scan.affected_provider_ids {
+                delete_discovered_session(
+                    &tx,
+                    scan.provider,
+                    scan.discovery_source,
+                    provider_id,
+                )?;
+            }
+        }
+        for provider_id in scan.durable_provider_ids {
+            delete_discovered_session(
+                &tx,
+                scan.provider,
+                scan.discovery_source,
+                provider_id,
+            )?;
+        }
+        for parsed in scan.sessions {
+            upsert_session_rows(&tx, parsed)?;
+        }
+        if let Some(checkpoint) = scan.checkpoint {
+            tx.execute(
+                "insert into files_seen(provider,source_path,mtime_ns,size_bytes,last_indexed_at,content_hash)
+                 values(?1,?2,0,0,?3,?4) on conflict(provider,source_path) do update set
+                 mtime_ns=0, size_bytes=0, last_indexed_at=excluded.last_indexed_at,
+                 content_hash=excluded.content_hash",
+                params![
+                    scan.provider.as_str(),
+                    scan.checkpoint_path,
+                    Utc::now().to_rfc3339(),
+                    checkpoint
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -173,79 +229,8 @@ impl Db {
         size_bytes: i64,
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
+        upsert_session_rows(&tx, parsed)?;
         let session = &parsed.session;
-        tx.execute(
-            "
-            insert into sessions (
-                id, provider, provider_session_id, title, summary, cwd, repo_root, created_at,
-                updated_at, last_message_at, preview_text, source_path, message_count, parse_version,
-                raw_metadata_json, parse_warning, discovery_source
-            ) values (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
-                ?9, ?10, ?11, ?12, ?13, ?14,
-                ?15, ?16, ?17
-            )
-            on conflict(id) do update set
-                provider = excluded.provider,
-                provider_session_id = excluded.provider_session_id,
-                title = excluded.title,
-                summary = excluded.summary,
-                cwd = excluded.cwd,
-                repo_root = excluded.repo_root,
-                created_at = excluded.created_at,
-                updated_at = excluded.updated_at,
-                last_message_at = excluded.last_message_at,
-                preview_text = excluded.preview_text,
-                source_path = excluded.source_path,
-                message_count = excluded.message_count,
-                parse_version = excluded.parse_version,
-                raw_metadata_json = excluded.raw_metadata_json,
-                parse_warning = excluded.parse_warning,
-                discovery_source = excluded.discovery_source
-            ",
-            params![
-                session.id,
-                session.provider.as_str(),
-                session.provider_session_id,
-                session.title,
-                session.summary,
-                session.cwd,
-                session.repo_root,
-                session.created_at.map(|value| value.to_rfc3339()),
-                session.updated_at.map(|value| value.to_rfc3339()),
-                session.last_message_at.map(|value| value.to_rfc3339()),
-                session.preview_text,
-                session.source_path,
-                session.message_count,
-                session.parse_version,
-                session.raw_metadata_json,
-                session.parse_warning,
-                session.discovery_source,
-            ],
-        )?;
-        tx.execute(
-            "
-            insert into transcripts (session_id, transcript_text)
-            values (?1, ?2)
-            on conflict(session_id) do update set transcript_text = excluded.transcript_text
-            ",
-            params![session.id, parsed.transcript_text],
-        )?;
-        // Update FTS index: delete old entry then insert new one
-        tx.execute(
-            "insert or replace into sessions_fts (rowid, title, summary, preview_text, transcript_text)
-             values (
-                 (select rowid from sessions where id = ?1),
-                 ?2, ?3, ?4, ?5
-             )",
-            params![
-                session.id,
-                session.title,
-                session.summary,
-                session.preview_text,
-                parsed.transcript_text,
-            ],
-        )?;
         tx.execute(
             "
             insert into files_seen (provider, source_path, mtime_ns, size_bytes, last_indexed_at, content_hash)
@@ -571,6 +556,132 @@ impl Db {
     }
 }
 
+fn upsert_session_rows(tx: &Transaction<'_>, parsed: &ParsedSession) -> Result<()> {
+    let session = &parsed.session;
+    tx.execute(
+        "
+        insert into sessions (
+            id, provider, provider_session_id, title, summary, cwd, repo_root, created_at,
+            updated_at, last_message_at, preview_text, source_path, message_count, parse_version,
+            raw_metadata_json, parse_warning, discovery_source
+        ) values (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+            ?9, ?10, ?11, ?12, ?13, ?14,
+            ?15, ?16, ?17
+        )
+        on conflict(id) do update set
+            provider = excluded.provider,
+            provider_session_id = excluded.provider_session_id,
+            title = excluded.title,
+            summary = excluded.summary,
+            cwd = excluded.cwd,
+            repo_root = excluded.repo_root,
+            created_at = excluded.created_at,
+            updated_at = excluded.updated_at,
+            last_message_at = excluded.last_message_at,
+            preview_text = excluded.preview_text,
+            source_path = excluded.source_path,
+            message_count = excluded.message_count,
+            parse_version = excluded.parse_version,
+            raw_metadata_json = excluded.raw_metadata_json,
+            parse_warning = excluded.parse_warning,
+            discovery_source = excluded.discovery_source
+        ",
+        params![
+            session.id,
+            session.provider.as_str(),
+            session.provider_session_id,
+            session.title,
+            session.summary,
+            session.cwd,
+            session.repo_root,
+            session.created_at.map(|value| value.to_rfc3339()),
+            session.updated_at.map(|value| value.to_rfc3339()),
+            session.last_message_at.map(|value| value.to_rfc3339()),
+            session.preview_text,
+            session.source_path,
+            session.message_count,
+            session.parse_version,
+            session.raw_metadata_json,
+            session.parse_warning,
+            session.discovery_source,
+        ],
+    )?;
+    tx.execute(
+        "insert into transcripts (session_id, transcript_text)
+         values (?1, ?2)
+         on conflict(session_id) do update set transcript_text = excluded.transcript_text",
+        params![session.id, parsed.transcript_text],
+    )?;
+    tx.execute(
+        "insert or replace into sessions_fts (rowid, title, summary, preview_text, transcript_text)
+         values (
+             (select rowid from sessions where id = ?1),
+             ?2, ?3, ?4, ?5
+         )",
+        params![
+            session.id,
+            session.title,
+            session.summary,
+            session.preview_text,
+            parsed.transcript_text,
+        ],
+    )?;
+    Ok(())
+}
+
+fn delete_discovered_sessions(
+    tx: &Transaction<'_>,
+    provider: Provider,
+    discovery_source: &str,
+) -> Result<()> {
+    tx.execute(
+        "delete from sessions_fts where rowid in (
+            select rowid from sessions where provider = ?1 and discovery_source = ?2
+        )",
+        params![provider.as_str(), discovery_source],
+    )?;
+    tx.execute(
+        "delete from transcripts where session_id in (
+            select id from sessions where provider = ?1 and discovery_source = ?2
+        )",
+        params![provider.as_str(), discovery_source],
+    )?;
+    tx.execute(
+        "delete from sessions where provider = ?1 and discovery_source = ?2",
+        params![provider.as_str(), discovery_source],
+    )?;
+    Ok(())
+}
+
+fn delete_discovered_session(
+    tx: &Transaction<'_>,
+    provider: Provider,
+    discovery_source: &str,
+    provider_session_id: &str,
+) -> Result<()> {
+    tx.execute(
+        "delete from sessions_fts where rowid in (
+            select rowid from sessions
+            where provider = ?1 and discovery_source = ?2 and provider_session_id = ?3
+        )",
+        params![provider.as_str(), discovery_source, provider_session_id],
+    )?;
+    tx.execute(
+        "delete from transcripts where session_id in (
+            select id from sessions
+            where provider = ?1 and discovery_source = ?2 and provider_session_id = ?3
+        )",
+        params![provider.as_str(), discovery_source, provider_session_id],
+    )?;
+    tx.execute(
+        "delete from sessions
+         where provider = ?1 and discovery_source = ?2 and provider_session_id = ?3",
+        params![provider.as_str(), discovery_source, provider_session_id],
+    )?;
+    Ok(())
+}
+
 fn row_to_session_with_transcript(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<SessionWithTranscript> {
@@ -608,4 +719,89 @@ fn row_to_session_with_transcript(
         },
         transcript_text: row.get(17)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::codex_logs::DISCOVERY_SOURCE;
+    use std::collections::HashSet;
+    use tempfile::tempdir;
+
+    fn parsed(id: &str, discovery_source: &str) -> ParsedSession {
+        ParsedSession {
+            session: SessionRecord {
+                id: format!("codex:{id}"),
+                provider: Provider::Codex,
+                provider_session_id: id.into(),
+                title: Some(id.into()),
+                summary: None,
+                cwd: None,
+                repo_root: None,
+                created_at: None,
+                updated_at: None,
+                last_message_at: None,
+                preview_text: id.into(),
+                source_path: format!("/tmp/logs_2.sqlite#thread={id}"),
+                message_count: Some(1),
+                parse_version: "test".into(),
+                raw_metadata_json: None,
+                parse_warning: None,
+                discovery_source: discovery_source.into(),
+            },
+            transcript_text: id.into(),
+        }
+    }
+
+    #[test]
+    fn source_scan_replaces_only_diagnostic_rows_and_commits_checkpoint() {
+        let dir = tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let checkpoint_path = "/tmp/logs_2.sqlite";
+        db.commit_source_scan(SourceScanCommit {
+            provider: Provider::Codex,
+            checkpoint_path,
+            discovery_source: DISCOVERY_SOURCE,
+            checkpoint: Some("codex-logs-v2:min-id=1:max-id=2"),
+            replace_all: true,
+            affected_provider_ids: &[],
+            durable_provider_ids: &HashSet::new(),
+            sessions: &[parsed("lost", DISCOVERY_SOURCE)],
+        })
+        .unwrap();
+        assert_eq!(
+            db.source_checkpoint(Provider::Codex, checkpoint_path)
+                .unwrap()
+                .as_deref(),
+            Some("codex-logs-v2:min-id=1:max-id=2")
+        );
+
+        db.upsert_session(&parsed("durable", "jsonl+sqlite"), 1, 1)
+            .unwrap();
+        db.commit_source_scan(SourceScanCommit {
+            provider: Provider::Codex,
+            checkpoint_path,
+            discovery_source: DISCOVERY_SOURCE,
+            checkpoint: Some("codex-logs-v2:min-id=1:max-id=3"),
+            replace_all: false,
+            affected_provider_ids: &["lost".into(), "durable".into()],
+            durable_provider_ids: &HashSet::from(["durable".into()]),
+            sessions: &[],
+        })
+        .unwrap();
+        assert!(db.resolve_session("lost").is_err());
+        assert_eq!(
+            db.resolve_session("durable")
+                .unwrap()
+                .session
+                .discovery_source,
+            "jsonl+sqlite"
+        );
+        assert_eq!(
+            db.source_checkpoint(Provider::Codex, checkpoint_path)
+                .unwrap()
+                .as_deref(),
+            Some("codex-logs-v2:min-id=1:max-id=3")
+        );
+    }
 }

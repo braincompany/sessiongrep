@@ -1,11 +1,15 @@
 use anyhow::Result;
 
 use crate::config::Config;
-use crate::db::Db;
+use crate::db::{Db, SourceScanCommit};
 use crate::models::Provider;
 use crate::providers::{
-    antigravity::AntigravityAdapter, claude::ClaudeAdapter, codex::CodexAdapter,
-    codex_logs::CodexLogsAdapter, cursor::CursorAdapter, pi::PiAdapter,
+    antigravity::AntigravityAdapter,
+    claude::ClaudeAdapter,
+    codex::CodexAdapter,
+    codex_logs::{CodexLogsAdapter, DISCOVERY_SOURCE},
+    cursor::CursorAdapter,
+    pi::PiAdapter,
 };
 use crate::util::normalize_path;
 
@@ -84,22 +88,34 @@ pub fn reindex(
     if config.providers.codex.enabled {
         let logs = CodexLogsAdapter::new(&config.codex_home());
         let source_path = logs.source_path();
-        let current_max = logs.max_row_id();
-        let unchanged = matches!(current_max.as_ref(), Ok(Some(max)) if !full && db.source_cursor(Provider::Codex, &source_path)? == Some(*max));
-        if !unchanged {
-            match logs.recover(&codex.durable_ids()) {
-                Ok((sessions, _health)) => {
-                    for parsed in sessions {
-                        db.upsert_session(&parsed, 0, 0)?;
-                        updated += 1;
-                    }
-                    if let Ok(Some(max)) = current_max {
-                        db.mark_source_cursor(Provider::Codex, &source_path, max)?;
-                    }
+        let durable_ids = codex.durable_ids();
+        let stale_diagnostic_ids: std::collections::HashSet<_> = db
+            .discovered_provider_ids(Provider::Codex, DISCOVERY_SOURCE)?
+            .intersection(&durable_ids)
+            .cloned()
+            .collect();
+        let checkpoint = (!full)
+            .then(|| db.source_checkpoint(Provider::Codex, &source_path))
+            .transpose()?
+            .flatten();
+        match logs.recover(&durable_ids, checkpoint.as_deref()) {
+            Ok(recovery) => {
+                if !recovery.unchanged || !stale_diagnostic_ids.is_empty() {
+                    updated += recovery.sessions.len();
+                    db.commit_source_scan(SourceScanCommit {
+                        provider: Provider::Codex,
+                        checkpoint_path: &source_path,
+                        discovery_source: DISCOVERY_SOURCE,
+                        checkpoint: recovery.checkpoint.as_deref(),
+                        replace_all: recovery.replace_all,
+                        affected_provider_ids: &recovery.affected_ids,
+                        durable_provider_ids: &stale_diagnostic_ids,
+                        sessions: &recovery.sessions,
+                    })?;
                 }
-                Err(err) => {
-                    eprintln!("sessiongrep: optional Codex logs source unavailable: {err:#}")
-                }
+            }
+            Err(err) => {
+                eprintln!("sessiongrep: optional Codex logs source unavailable: {err:#}")
             }
         }
     }

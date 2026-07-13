@@ -2,13 +2,14 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
 use regex::Regex;
-use rusqlite::Connection;
-use serde_json::{json, Value};
+use rusqlite::{Connection, OpenFlags};
+use serde_json::{Value, json};
 
 use crate::models::{ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
@@ -245,7 +246,12 @@ fn load_threads(path: &Path) -> Result<HashMap<String, CodexMetadata>> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
-    let conn = Connection::open(path)?;
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    conn.busy_timeout(Duration::from_millis(1_000))?;
+    conn.pragma_update(None, "query_only", true)?;
     let mut stmt = conn.prepare(
         "select id, title, cwd, created_at, updated_at, rollout_path, first_user_message from threads",
     )?;

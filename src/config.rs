@@ -72,6 +72,16 @@ fn default_preview_lines() -> usize {
     30
 }
 
+fn default_codex_home() -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("~"))
+                .join(".codex")
+        })
+}
+
 impl Default for Config {
     fn default() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
@@ -83,7 +93,10 @@ impl Default for Config {
                 },
                 codex: ProviderConfig {
                     enabled: true,
-                    paths: vec![home.join(".codex/sessions").to_string_lossy().to_string()],
+                    paths: vec![default_codex_home()
+                        .join("sessions")
+                        .to_string_lossy()
+                        .to_string()],
                 },
                 cursor: ProviderConfig {
                     enabled: true,
@@ -91,17 +104,11 @@ impl Default for Config {
                 },
                 antigravity: ProviderConfig {
                     enabled: true,
-                    paths: vec![home
-                        .join(".gemini/antigravity/brain")
-                        .to_string_lossy()
-                        .to_string()],
+                    paths: vec![home.join(".gemini/antigravity/brain").to_string_lossy().to_string()],
                 },
                 pi: ProviderConfig {
                     enabled: true,
-                    paths: vec![home
-                        .join(".pi/agent/sessions")
-                        .to_string_lossy()
-                        .to_string()],
+                    paths: vec![home.join(".pi/agent/sessions").to_string_lossy().to_string()],
                 },
             },
             index: IndexConfig {
@@ -265,12 +272,6 @@ impl Config {
     }
 
     pub fn codex_home(&self) -> PathBuf {
-        std::env::var_os("CODEX_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("~"))
-                    .join(".codex")
-            })
+        default_codex_home()
     }
 }
