@@ -8,6 +8,7 @@ use sessiongrep::config::Config;
 use sessiongrep::db::Db;
 use sessiongrep::indexer;
 use sessiongrep::models::{Provider, SearchFilters};
+use sessiongrep::untrusted_recall;
 use sessiongrep::util::{current_repo, resume_plan, truncate_for_display};
 
 /// Minimum gap between incremental reindexes triggered by MCP tool calls.
@@ -277,7 +278,7 @@ fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<String
             .unwrap_or_else(|| "-".to_string());
 
         out.push_str(&format!(
-            "## {} [{}] (score: {})\n- ID: {}\n- Provider: {}\n- CWD: {}\n- Updated: {}\n- Match: {} — {}\n\n",
+            "## {} [{}] (score: {})\n- ID: {}\n- Provider: {}\n- CWD: {}\n- Updated: {}\n- Match: {} — {}\n",
             title,
             s.provider,
             hit.score,
@@ -288,6 +289,14 @@ fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<String
             hit.match_source,
             hit.match_snippet,
         ));
+        if let Some(note) =
+            untrusted_recall::untrusted_hit_note(&untrusted_recall::scan_recall_text(
+                &hit.match_snippet,
+            ))
+        {
+            out.push_str(&note);
+        }
+        out.push('\n');
     }
     Ok(out)
 }
@@ -328,11 +337,15 @@ fn tool_get_session(args: &Value, db: &Db) -> Result<String, String> {
         .unwrap_or_else(|| "-".to_string());
 
     Ok(format!(
-        "# {title}\n\n- ID: {}\n- Provider: {}\n- Provider Session ID: {}\n- CWD: {cwd}\n- Updated: {updated}\n- Messages: {}\n\n## Transcript\n\n{transcript}",
+        "{banner}# {title}\n\n- ID: {}\n- Provider: {}\n- Provider Session ID: {}\n- CWD: {cwd}\n- Updated: {updated}\n- Messages: {}\n\n## Transcript\n\n{transcript}",
         s.id,
         s.provider,
         s.provider_session_id,
         s.message_count.unwrap_or(0),
+        banner = untrusted_recall::untrusted_recall_banner(&untrusted_recall::scan_recall_text(
+            &transcript
+        ))
+        .unwrap_or_default(),
     ))
 }
 

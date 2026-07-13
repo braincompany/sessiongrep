@@ -104,8 +104,8 @@ The agent will call `search_sessions` to find matches and `get_session` to pull 
 
 | Tool | Description |
 |------|-------------|
-| `search_sessions` | Search sessions by keyword, with optional provider filter and limit |
-| `get_session` | Get full transcript and metadata by session ID (supports `max_lines` to limit context) |
+| `search_sessions` | Search sessions by keyword, with optional provider filter and limit. Annotates hits when match snippets match recall heuristics. |
+| `get_session` | Get full transcript and metadata by session ID (supports `max_lines` to limit context). Prepends an untrusted-content warning when recall heuristics match. |
 | `list_sessions` | List recent sessions, filterable by provider and path prefix |
 | `get_resume_command` | Get the CLI command to resume a session in its native tool |
 
