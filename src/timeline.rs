@@ -7,7 +7,7 @@ use crate::util::truncate_for_display;
 
 pub const DEFAULT_LIMIT: usize = 30;
 pub const MAX_LIMIT: usize = 200;
-const TITLE_DISPLAY_LEN: usize = 100;
+const TITLE_DISPLAY_LEN: usize = 120;
 const CWD_DISPLAY_LEN: usize = 80;
 
 #[derive(Debug, Clone)]
@@ -115,7 +115,7 @@ pub fn format_timeline_markdown(repo_prefix: &str, days: &[TimelineDay]) -> Stri
                 .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
                 .unwrap_or_else(|| "-".to_string());
             out.push_str(&format!(
-                "- **{title}** [{provider}] {updated} | CWD: {cwd} | ID: {id}\n",
+                "- **{title}** [{provider}] — {updated} | CWD: {cwd} | ID: {id}\n",
                 provider = session.provider,
                 id = session.id,
             ));
@@ -131,7 +131,8 @@ pub fn build_repo_timeline(
     repo_prefix: &str,
     limit: usize,
 ) -> String {
-    let limit = clamp_limit(limit);
+    // Caller (`tool_timeline_for_repo`) is responsible for clamp_limit before the DB query.
+    let limit = limit.max(1);
     let mut matched: Vec<SessionRecord> = sessions
         .into_iter()
         .filter(|s| matches_repo_prefix(s, repo_prefix))
