@@ -1,0 +1,14 @@
+{
+  "name": "sessiongrep",
+  "owner": {
+    "name": "sessiongrep",
+    "url": "https://github.com/braincompany/sessiongrep"
+  },
+  "plugins": [
+    {
+      "name": "resume-verbose",
+      "source": "./resume-verbose",
+      "description": "Verbose session listing — role-split timestamps, the reply gap, branch, last prompt, and recap"
+    }
+  ]
+}

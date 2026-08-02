@@ -2,3 +2,7 @@
 
 # macOS
 .DS_Store
+
+# Python bytecode (integrations/)
+__pycache__/
+*.pyc
