@@ -56,6 +56,16 @@ pub struct SessionRecord {
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
     pub last_message_at: Option<DateTime<Utc>>,
+    /// VCS branch the session ran on. `cwd` alone rarely identifies a session — several
+    /// dozen can share one working directory; the branch is what separates them.
+    pub git_branch: Option<String>,
+    /// Split of `last_message_at` by role. The gap between the two is the signal for
+    /// "abandoned mid-turn" vs. "finished cleanly", which a single timestamp cannot express.
+    pub last_user_message_at: Option<DateTime<Utc>>,
+    pub last_assistant_message_at: Option<DateTime<Utc>>,
+    /// What the agent last said. `summary` holds the *first* user message and `preview_text`
+    /// the last prompt, so without this the agent's side of the conversation is unrecorded.
+    pub last_assistant_text: Option<String>,
     pub preview_text: String,
     pub source_path: String,
     pub message_count: Option<i64>,
