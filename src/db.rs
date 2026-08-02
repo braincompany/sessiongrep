@@ -45,6 +45,10 @@ impl Db {
                 created_at text,
                 updated_at text,
                 last_message_at text,
+                git_branch text,
+                last_user_message_at text,
+                last_assistant_message_at text,
+                last_assistant_text text,
                 preview_text text not null,
                 source_path text not null,
                 message_count integer,
@@ -71,6 +75,25 @@ impl Db {
             create index if not exists idx_sessions_provider_id on sessions(provider_session_id);
             ",
         )?;
+        // Migrate: add session-identity columns to indexes created before they existed.
+        // `create table if not exists` above is a no-op on an existing DB, so add them here.
+        // Values stay null until the file is reparsed, which the parse_version bump forces.
+        let existing: std::collections::HashSet<String> = self
+            .conn
+            .prepare("select name from pragma_table_info('sessions')")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for column in [
+            "git_branch",
+            "last_user_message_at",
+            "last_assistant_message_at",
+            "last_assistant_text",
+        ] {
+            if !existing.contains(column) {
+                self.conn
+                    .execute_batch(&format!("alter table sessions add column {column} text"))?;
+            }
+        }
         // Migrate: drop old contentless FTS table if present, then create regular FTS table
         let fts_sql: Option<String> = self
             .conn
@@ -153,12 +176,15 @@ impl Db {
             "
             insert into sessions (
                 id, provider, provider_session_id, title, summary, cwd, repo_root, created_at,
-                updated_at, last_message_at, preview_text, source_path, message_count, parse_version,
+                updated_at, last_message_at, git_branch, last_user_message_at,
+                last_assistant_message_at, last_assistant_text,
+                preview_text, source_path, message_count, parse_version,
                 raw_metadata_json, parse_warning, discovery_source
             ) values (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
                 ?9, ?10, ?11, ?12, ?13, ?14,
-                ?15, ?16, ?17
+                ?15, ?16, ?17, ?18,
+                ?19, ?20, ?21
             )
             on conflict(id) do update set
                 provider = excluded.provider,
@@ -170,6 +196,10 @@ impl Db {
                 created_at = excluded.created_at,
                 updated_at = excluded.updated_at,
                 last_message_at = excluded.last_message_at,
+                git_branch = excluded.git_branch,
+                last_user_message_at = excluded.last_user_message_at,
+                last_assistant_message_at = excluded.last_assistant_message_at,
+                last_assistant_text = excluded.last_assistant_text,
                 preview_text = excluded.preview_text,
                 source_path = excluded.source_path,
                 message_count = excluded.message_count,
@@ -189,6 +219,12 @@ impl Db {
                 session.created_at.map(|value| value.to_rfc3339()),
                 session.updated_at.map(|value| value.to_rfc3339()),
                 session.last_message_at.map(|value| value.to_rfc3339()),
+                session.git_branch,
+                session.last_user_message_at.map(|value| value.to_rfc3339()),
+                session
+                    .last_assistant_message_at
+                    .map(|value| value.to_rfc3339()),
+                session.last_assistant_text,
                 session.preview_text,
                 session.source_path,
                 session.message_count,
@@ -261,7 +297,9 @@ impl Db {
         let sql = "
             select
                 s.id, s.provider, s.provider_session_id, s.title, s.summary, s.cwd, s.repo_root,
-                s.created_at, s.updated_at, s.last_message_at, s.preview_text, s.source_path,
+                s.created_at, s.updated_at, s.last_message_at,
+                s.git_branch, s.last_user_message_at, s.last_assistant_message_at, s.last_assistant_text,
+                s.preview_text, s.source_path,
                 s.message_count, s.parse_version, s.raw_metadata_json, s.parse_warning, s.discovery_source
             from sessions s
             where lower(coalesce(s.cwd, '')) like ? escape '\\'
@@ -437,7 +475,9 @@ impl Db {
             "
             select
                 s.id, s.provider, s.provider_session_id, s.title, s.summary, s.cwd, s.repo_root,
-                s.created_at, s.updated_at, s.last_message_at, s.preview_text, s.source_path,
+                s.created_at, s.updated_at, s.last_message_at,
+                s.git_branch, s.last_user_message_at, s.last_assistant_message_at, s.last_assistant_text,
+                s.preview_text, s.source_path,
                 s.message_count, s.parse_version, s.raw_metadata_json, s.parse_warning, s.discovery_source,
                 coalesce(t.transcript_text, '')
             from sessions s
@@ -482,7 +522,9 @@ impl Db {
             "
             select
                 s.id, s.provider, s.provider_session_id, s.title, s.summary, s.cwd, s.repo_root,
-                s.created_at, s.updated_at, s.last_message_at, s.preview_text, s.source_path,
+                s.created_at, s.updated_at, s.last_message_at,
+                s.git_branch, s.last_user_message_at, s.last_assistant_message_at, s.last_assistant_text,
+                s.preview_text, s.source_path,
                 s.message_count, s.parse_version, s.raw_metadata_json, s.parse_warning, s.discovery_source,
                 coalesce(t.transcript_text, '')
             from sessions s
@@ -534,7 +576,9 @@ impl Db {
             "
             select
                 s.id, s.provider, s.provider_session_id, s.title, s.summary, s.cwd, s.repo_root,
-                s.created_at, s.updated_at, s.last_message_at, s.preview_text, s.source_path,
+                s.created_at, s.updated_at, s.last_message_at,
+                s.git_branch, s.last_user_message_at, s.last_assistant_message_at, s.last_assistant_text,
+                s.preview_text, s.source_path,
                 s.message_count, s.parse_version, s.raw_metadata_json, s.parse_warning, s.discovery_source,
                 coalesce(t.transcript_text, '')
             from sessions s
@@ -599,13 +643,23 @@ fn row_to_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRec
             .get::<_, Option<String>>(9)?
             .as_deref()
             .and_then(crate::util::parse_datetime),
-        preview_text: row.get(10)?,
-        source_path: row.get(11)?,
-        message_count: row.get(12)?,
-        parse_version: row.get(13)?,
-        raw_metadata_json: row.get(14)?,
-        parse_warning: row.get(15)?,
-        discovery_source: row.get(16)?,
+        git_branch: row.get(10)?,
+        last_user_message_at: row
+            .get::<_, Option<String>>(11)?
+            .as_deref()
+            .and_then(crate::util::parse_datetime),
+        last_assistant_message_at: row
+            .get::<_, Option<String>>(12)?
+            .as_deref()
+            .and_then(crate::util::parse_datetime),
+        last_assistant_text: row.get(13)?,
+        preview_text: row.get(14)?,
+        source_path: row.get(15)?,
+        message_count: row.get(16)?,
+        parse_version: row.get(17)?,
+        raw_metadata_json: row.get(18)?,
+        parse_warning: row.get(19)?,
+        discovery_source: row.get(20)?,
     })
 }
 
@@ -614,7 +668,7 @@ fn row_to_session_with_transcript(
 ) -> rusqlite::Result<SessionWithTranscript> {
     Ok(SessionWithTranscript {
         session: row_to_session_record(row)?,
-        transcript_text: row.get(17)?,
+        transcript_text: row.get(21)?,
     })
 }
 
