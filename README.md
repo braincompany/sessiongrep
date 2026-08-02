@@ -110,6 +110,21 @@ The agent will call `search_sessions` to find matches and `get_session` to pull 
 | `timeline_for_repo` | Day-bucketed metadata timeline for a repo path prefix — scoped view of what changed over time |
 | `get_resume_command` | Get the CLI command to resume a session in its native tool |
 
+## Claude Code plugin
+
+`integrations/claude-code/` ships a `/resume-verbose` slash command — a session picker that
+answers *"which session was I in?"* without resuming each candidate. It shows when you last
+spoke, when the agent last replied, and **the gap between them** — the signal that separates
+"finished cleanly" from "abandoned mid-turn" — plus the branch, your last prompt, and a recap.
+
+```bash
+/plugin marketplace add <path-to-sessiongrep>/integrations/claude-code
+/plugin install resume-verbose
+```
+
+It reads this index (falling back to globbing `~/.claude/projects` if sessiongrep isn't
+installed), entirely read-only. See [the plugin README](./integrations/claude-code/resume-verbose/README.md).
+
 ## Config
 
 Optional config file at `~/.config/sessiongrep/config.toml`:

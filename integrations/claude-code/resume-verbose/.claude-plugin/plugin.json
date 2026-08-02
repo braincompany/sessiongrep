@@ -1,0 +1,9 @@
+{
+  "name": "resume-verbose",
+  "version": "0.1.0",
+  "description": "Verbose session listing — role-split timestamps, the gap between them, branch, last prompt, and recap, so you can tell which session to resume without opening each one",
+  "author": {
+    "name": "Michael Andemeskel",
+    "email": "michael.andemeskel@braincompany.ai"
+  }
+}
