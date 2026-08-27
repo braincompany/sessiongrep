@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
 use regex::Regex;
 use rusqlite::Connection;
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::models::{ParsedSession, Provider, SessionRecord, SourceFile};
@@ -15,7 +16,7 @@ use crate::util::{
     parse_datetime, parse_unix_seconds, preview_from_text, truncate_for_display,
 };
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 struct CodexMetadata {
     title: Option<String>,
     cwd: Option<String>,
@@ -87,6 +88,19 @@ impl CodexAdapter {
             Ok(parsed) => parsed,
             Err(err) => minimal_record(Provider::Codex, &source.path, err.to_string()),
         }
+    }
+
+    pub fn metadata_fingerprint(&self, source: &SourceFile) -> String {
+        let provider_session_id = self.extract_id(&source.path);
+        let metadata = provider_session_id
+            .as_deref()
+            .and_then(|id| self.threads.get(id));
+        let explicit_title = provider_session_id
+            .as_deref()
+            .and_then(|id| self.index_titles.get(id));
+        let bytes = serde_json::to_vec(&("codex-metadata-v2", metadata, explicit_title))
+            .expect("Codex metadata should serialize");
+        stable_fingerprint(&bytes)
     }
 
     fn parse_inner(&self, path: &Path) -> Result<ParsedSession> {
@@ -170,9 +184,11 @@ impl CodexAdapter {
             .get(&provider_session_id)
             .cloned()
             .unwrap_or_default();
-        let title = meta
-            .title
-            .or_else(|| self.index_titles.get(&provider_session_id).cloned())
+        let title = self
+            .index_titles
+            .get(&provider_session_id)
+            .cloned()
+            .or_else(|| meta.title.filter(|title| !title.trim().is_empty()))
             .or_else(|| first_user.clone())
             .map(|text| truncate_for_display(&text, 100));
         let summary = meta
@@ -209,7 +225,7 @@ impl CodexAdapter {
             preview_text: preview,
             source_path: normalize_path(path),
             message_count: Some(message_count),
-            parse_version: "codex-v1".to_string(),
+            parse_version: "codex-v2".to_string(),
             raw_metadata_json,
             parse_warning: None,
             discovery_source: "jsonl+sqlite".to_string(),
@@ -228,6 +244,15 @@ impl CodexAdapter {
             .and_then(|captures| captures.get(1))
             .map(|match_| match_.as_str().to_string())
     }
+}
+
+fn stable_fingerprint(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn load_threads(path: &Path) -> Result<HashMap<String, CodexMetadata>> {
@@ -275,9 +300,151 @@ fn load_index_titles(path: &Path) -> Result<HashMap<String, String>> {
             value.get("id").and_then(Value::as_str),
             value.get("thread_name").and_then(Value::as_str),
         ) {
-            map.insert(id.to_string(), title.to_string());
+            let title = title.trim();
+            if title.is_empty() {
+                map.remove(id);
+            } else {
+                map.insert(id.to_string(), title.to_string());
+            }
         }
     }
     Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CodexAdapter;
+    use rusqlite::{Connection, params};
+    use std::fs;
+    use tempfile::tempdir;
+
+    const SESSION_ID: &str = "019f337f-adda-7271-9924-f43714dd8c8e";
+
+    fn write_rollout(root: &std::path::Path) -> std::path::PathBuf {
+        fs::create_dir_all(root).unwrap();
+        let path = root.join(format!(
+            "rollout-2026-08-01T12-00-00-{SESSION_ID}.jsonl"
+        ));
+        fs::write(
+            &path,
+            format!(
+                r#"{{"timestamp":"2026-08-01T12:00:00Z","type":"session_meta","payload":{{"id":"{SESSION_ID}","cwd":"/tmp/demo","timestamp":"2026-08-01T12:00:00Z"}}}}
+{{"timestamp":"2026-08-01T12:00:01Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"Generated from first prompt"}}]}}}}
+"#
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn write_state_db(home: &std::path::Path) {
+        let conn = Connection::open(home.join("state_5.sqlite")).unwrap();
+        conn.execute_batch(
+            "create table threads (
+                id text primary key,
+                title text,
+                cwd text,
+                created_at integer,
+                updated_at integer,
+                rollout_path text,
+                first_user_message text
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "insert into threads (
+                id, title, cwd, created_at, updated_at, rollout_path, first_user_message
+             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                SESSION_ID,
+                "Generated from first prompt",
+                "/tmp/demo",
+                1_754_048_000_i64,
+                1_754_048_001_i64,
+                "/tmp/rollout.jsonl",
+                "Generated from first prompt",
+            ],
+        )
+        .unwrap();
+    }
+
+    fn append_name(home: &std::path::Path, name: &str) {
+        use std::io::Write;
+
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(home.join("session_index.jsonl"))
+            .unwrap();
+        writeln!(
+            file,
+            r#"{{"id":"{SESSION_ID}","thread_name":"{name}","updated_at":"2026-08-01T12:00:02Z"}}"#
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn explicit_session_name_takes_precedence_over_generated_title() {
+        let temp = tempdir().unwrap();
+        let home = temp.path();
+        let sessions = home.join("sessions");
+        write_rollout(&sessions);
+        write_state_db(home);
+        append_name(home, "Old session name");
+        append_name(home, "Meaningful session name");
+
+        let adapter = CodexAdapter::new(vec![sessions], home.to_path_buf());
+        let sources = adapter.discover();
+        let parsed = adapter.parse(&sources[0]);
+
+        assert_eq!(
+            parsed.session.title.as_deref(),
+            Some("Meaningful session name")
+        );
+    }
+
+    #[test]
+    fn blank_latest_name_restores_generated_title() {
+        let temp = tempdir().unwrap();
+        let home = temp.path();
+        let sessions = home.join("sessions");
+        write_rollout(&sessions);
+        write_state_db(home);
+        append_name(home, "Old session name");
+        append_name(home, "   ");
+
+        let adapter = CodexAdapter::new(vec![sessions], home.to_path_buf());
+        let sources = adapter.discover();
+        let parsed = adapter.parse(&sources[0]);
+
+        assert_eq!(
+            parsed.session.title.as_deref(),
+            Some("Generated from first prompt")
+        );
+    }
+
+    #[test]
+    fn metadata_fingerprint_changes_when_only_session_name_changes() {
+        let temp = tempdir().unwrap();
+        let home = temp.path();
+        let sessions = home.join("sessions");
+        write_rollout(&sessions);
+        write_state_db(home);
+        append_name(home, "Old name");
+
+        let old_adapter = CodexAdapter::new(vec![sessions.clone()], home.to_path_buf());
+        let old_source = old_adapter.discover().remove(0);
+        let old_fingerprint = old_adapter.metadata_fingerprint(&old_source);
+
+        append_name(home, "New name");
+
+        let new_adapter = CodexAdapter::new(vec![sessions], home.to_path_buf());
+        let new_source = new_adapter.discover().remove(0);
+        let new_fingerprint = new_adapter.metadata_fingerprint(&new_source);
+
+        assert_eq!(old_source.mtime_ns, new_source.mtime_ns);
+        assert_eq!(old_source.size_bytes, new_source.size_bytes);
+        assert_ne!(old_fingerprint, new_fingerprint);
+    }
 }
 

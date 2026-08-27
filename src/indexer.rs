@@ -13,8 +13,9 @@ use crate::util::normalize_path;
 ///
 /// Returns `(files_seen, sessions_updated)`. When `full` is true the database is
 /// cleared first and every discovered file is re-parsed. Otherwise each file is
-/// skipped when its `(mtime_ns, size_bytes)` already matches what's recorded in
-/// `files_seen`, making repeated calls cheap.
+/// skipped when its `(mtime_ns, size_bytes, content_hash)` already matches what's
+/// recorded in `files_seen`, making repeated calls cheap. Codex uses the hash to
+/// include sidecar metadata such as explicit session names in this freshness check.
 ///
 /// When `progress` is provided it's invoked with `(index, total, updated)` after
 /// each updated file so callers can render progress; the CLI uses this and the
@@ -57,12 +58,17 @@ pub fn reindex(
     let mut progress = progress;
     for (i, source) in sources.iter().enumerate() {
         let source_path = normalize_path(&source.path);
+        let content_hash = match source.provider {
+            Provider::Codex => Some(codex.metadata_fingerprint(source)),
+            _ => None,
+        };
         if !full
             && db.is_file_current(
                 source.provider,
                 &source_path,
                 source.mtime_ns,
                 source.size_bytes,
+                content_hash.as_deref(),
             )?
         {
             continue;
@@ -74,7 +80,12 @@ pub fn reindex(
             Provider::Antigravity => antigravity.parse(source),
             Provider::Pi => pi.parse(source),
         };
-        db.upsert_session(&parsed, source.mtime_ns, source.size_bytes)?;
+        db.upsert_session(
+            &parsed,
+            source.mtime_ns,
+            source.size_bytes,
+            content_hash.as_deref(),
+        )?;
         updated += 1;
         if let Some(cb) = progress.as_deref_mut() {
             cb(i + 1, total, updated);

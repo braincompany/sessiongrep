@@ -127,18 +127,29 @@ impl Db {
         path: &str,
         mtime_ns: i64,
         size: i64,
+        content_hash: Option<&str>,
     ) -> Result<bool> {
         let result = self
             .conn
             .query_row(
-                "select mtime_ns, size_bytes from files_seen where provider = ?1 and source_path = ?2",
+                "select mtime_ns, size_bytes, content_hash from files_seen where provider = ?1 and source_path = ?2",
                 params![provider.as_str(), path],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .optional()?;
-        Ok(
-            matches!(result, Some((stored_mtime, stored_size)) if stored_mtime == mtime_ns && stored_size == size),
-        )
+        Ok(matches!(
+            result,
+            Some((stored_mtime, stored_size, stored_hash))
+                if stored_mtime == mtime_ns
+                    && stored_size == size
+                    && stored_hash.as_deref() == content_hash
+        ))
     }
 
     pub fn upsert_session(
@@ -146,6 +157,7 @@ impl Db {
         parsed: &ParsedSession,
         mtime_ns: i64,
         size_bytes: i64,
+        content_hash: Option<&str>,
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         let session = &parsed.session;
@@ -224,11 +236,12 @@ impl Db {
         tx.execute(
             "
             insert into files_seen (provider, source_path, mtime_ns, size_bytes, last_indexed_at, content_hash)
-            values (?1, ?2, ?3, ?4, ?5, null)
+            values (?1, ?2, ?3, ?4, ?5, ?6)
             on conflict(provider, source_path) do update set
                 mtime_ns = excluded.mtime_ns,
                 size_bytes = excluded.size_bytes,
-                last_indexed_at = excluded.last_indexed_at
+                last_indexed_at = excluded.last_indexed_at,
+                content_hash = excluded.content_hash
             ",
             params![
                 session.provider.as_str(),
@@ -236,6 +249,7 @@ impl Db {
                 mtime_ns,
                 size_bytes,
                 Utc::now().to_rfc3339(),
+                content_hash,
             ],
         )?;
         tx.commit()?;
@@ -629,12 +643,57 @@ pub(crate) fn escape_like_prefix(prefix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::escape_like_prefix;
+    use super::{Db, escape_like_prefix};
+    use crate::models::Provider;
+    use rusqlite::params;
+    use tempfile::tempdir;
 
     #[test]
     fn escape_like_prefix_escapes_underscore_and_percent() {
         assert_eq!(escape_like_prefix("/home/me/my_app"), "/home/me/my\\_app");
         assert_eq!(escape_like_prefix("100%done"), "100\\%done");
         assert_eq!(escape_like_prefix(r"a\b"), r"a\\b");
+    }
+
+    #[test]
+    fn metadata_hash_participates_in_file_freshness() {
+        let temp = tempdir().unwrap();
+        let db = Db::open(&temp.path().join("index.db")).unwrap();
+        db.conn
+            .execute(
+                "insert into files_seen (
+                    provider, source_path, mtime_ns, size_bytes, last_indexed_at, content_hash
+                 ) values (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    Provider::Codex.as_str(),
+                    "/tmp/session.jsonl",
+                    10_i64,
+                    20_i64,
+                    "2026-08-01T12:00:00Z",
+                    "old-metadata",
+                ],
+            )
+            .unwrap();
+
+        assert!(
+            db.is_file_current(
+                Provider::Codex,
+                "/tmp/session.jsonl",
+                10,
+                20,
+                Some("old-metadata")
+            )
+            .unwrap()
+        );
+        assert!(
+            !db.is_file_current(
+                Provider::Codex,
+                "/tmp/session.jsonl",
+                10,
+                20,
+                Some("new-metadata")
+            )
+            .unwrap()
+        );
     }
 }
