@@ -4,7 +4,7 @@ use std::process::Command;
 
 use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use sessiongrep::config::Config;
 use sessiongrep::db::Db;
@@ -62,6 +62,9 @@ struct QueryArgs {
     limit: usize,
     #[arg(long)]
     warnings_only: bool,
+    /// Emit JSON instead of the human-readable listing.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -115,13 +118,30 @@ pub fn run() -> Result<()> {
         Commands::List(args) => {
             let filters = build_filters(&args, &config)?;
             let sessions = db.list_recent(&filters)?;
-            print_sessions(&sessions);
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&sessions)?);
+            } else {
+                print_sessions(&sessions);
+            }
         }
         Commands::Search(args) => {
             let filters = build_filters(&args.filters, &config)?;
             let current_repo = current_repo(&config);
             let hits = db.search(&args.query, &filters, current_repo.as_deref())?;
-            if hits.is_empty() {
+            if args.filters.json {
+                let payload: Vec<Value> = hits
+                    .iter()
+                    .map(|hit| {
+                        json!({
+                            "session": hit.session,
+                            "score": hit.score,
+                            "match_source": hit.match_source,
+                            "match_snippet": hit.match_snippet,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else if hits.is_empty() {
                 println!("no sessions matched");
             } else {
                 for hit in hits {

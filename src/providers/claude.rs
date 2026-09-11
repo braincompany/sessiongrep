@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 
 use crate::models::{ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
-    extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
-    parse_datetime, preview_from_text, substantive_text, truncate_for_display,
+    extract_text, find_repo_root, format_transcript_line, last_exchange, minimal_record,
+    normalize_path, parse_datetime, preview_from_text, substantive_text, truncate_for_display,
 };
 
 pub struct ClaudeAdapter {
@@ -85,6 +85,7 @@ impl ClaudeAdapter {
         let mut transcript_lines = Vec::new();
         let mut raw_meta = Vec::new();
         let mut last_prompt = None;
+        let mut git_branch: Option<String> = None;
 
         for line in raw.lines() {
             if line.trim().is_empty() {
@@ -111,6 +112,23 @@ impl ClaudeAdapter {
                     .get("cwd")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
+            }
+            // Take the newest branch seen: a session can outlive a checkout, and the branch
+            // it ended on is the one that identifies the work.
+            if let Some(branch) = value.get("gitBranch").and_then(Value::as_str) {
+                if !branch.is_empty() {
+                    git_branch = Some(branch.to_string());
+                }
+            }
+
+            // Subagent turns are a side conversation. Folding them in makes a delegated
+            // task's output look like the agent's reply to the user.
+            if value
+                .get("isSidechain")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                continue;
             }
 
             let timestamp = value
@@ -185,6 +203,8 @@ impl ClaudeAdapter {
             .or_else(|| first_user.clone())
             .map(|text| preview_from_text(&text))
             .unwrap_or_else(|| "(no preview available)".to_string());
+        let (last_user_message_at, last_assistant_message_at, last_assistant_text) =
+            last_exchange(&messages);
         let repo_root = cwd.as_deref().and_then(find_repo_root);
         let raw_metadata_json = Some(serde_json::to_string(&json!({
             "line_count": raw.lines().count(),
@@ -202,10 +222,17 @@ impl ClaudeAdapter {
             created_at,
             updated_at,
             last_message_at: updated_at,
+            git_branch,
+            last_user_message_at,
+            last_assistant_message_at,
+            last_assistant_text: last_assistant_text.map(|text| truncate_for_display(&text, 4000)),
             preview_text: preview,
             source_path: normalize_path(path),
             message_count: Some(messages.len() as i64),
-            parse_version: "claude-v1".to_string(),
+            // v2 adds git_branch, the role-split timestamps, last_assistant_text, and the
+            // isSidechain filter. Bumped so existing indexes reparse instead of serving rows
+            // that silently lack the new fields.
+            parse_version: "claude-v2".to_string(),
             raw_metadata_json,
             parse_warning: None,
             discovery_source: "jsonl".to_string(),
@@ -260,7 +287,100 @@ fn should_skip_message(value: &Value, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::should_skip_message;
+    use crate::models::Provider;
+    use crate::models::SourceFile;
     use serde_json::json;
+    use std::fs;
+    use tempfile::tempdir;
+
+    /// Parse a synthetic transcript through the real adapter.
+    fn parse_lines(lines: &str) -> crate::models::SessionRecord {
+        let temp = tempdir().expect("tempdir");
+        let path = temp
+            .path()
+            .join("11111111-2222-3333-4444-555555555555.jsonl");
+        fs::write(&path, lines).expect("write transcript");
+        let adapter = super::ClaudeAdapter::new(vec![temp.path().to_path_buf()]);
+        adapter
+            .parse(&SourceFile {
+                provider: Provider::Claude,
+                path,
+                mtime_ns: 0,
+                size_bytes: lines.len() as i64,
+            })
+            .session
+    }
+
+    #[test]
+    fn records_branch_and_role_split_timestamps() {
+        let session = parse_lines(
+            r#"{"type":"user","timestamp":"2026-01-01T10:00:00Z","gitBranch":"feat/towers","cwd":"/repo","message":{"role":"user","content":"first ask"}}
+{"type":"assistant","timestamp":"2026-01-01T10:01:00Z","gitBranch":"feat/towers","message":{"role":"assistant","content":[{"type":"text","text":"first answer"}]}}
+{"type":"user","timestamp":"2026-01-01T10:05:00Z","gitBranch":"feat/towers","message":{"role":"user","content":"second ask"}}
+{"type":"assistant","timestamp":"2026-01-01T10:09:00Z","gitBranch":"feat/towers","message":{"role":"assistant","content":[{"type":"text","text":"second answer"}]}}
+"#,
+        );
+        assert_eq!(session.git_branch.as_deref(), Some("feat/towers"));
+        assert_eq!(
+            session.last_user_message_at.map(|t| t.to_rfc3339()),
+            Some("2026-01-01T10:05:00+00:00".to_string())
+        );
+        assert_eq!(
+            session.last_assistant_message_at.map(|t| t.to_rfc3339()),
+            Some("2026-01-01T10:09:00+00:00".to_string())
+        );
+        assert_eq!(
+            session.last_assistant_text.as_deref(),
+            Some("second answer")
+        );
+        assert_eq!(session.parse_version, "claude-v2");
+    }
+
+    #[test]
+    fn last_branch_wins_when_the_session_switches_checkout() {
+        let session = parse_lines(
+            r#"{"type":"user","timestamp":"2026-01-01T10:00:00Z","gitBranch":"main","message":{"role":"user","content":"start"}}
+{"type":"assistant","timestamp":"2026-01-01T10:01:00Z","gitBranch":"feat/later","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}
+"#,
+        );
+        assert_eq!(session.git_branch.as_deref(), Some("feat/later"));
+    }
+
+    #[test]
+    fn subagent_turns_do_not_become_the_agents_reply() {
+        // The sidechain reply is both last in the file and newest. Without filtering it
+        // would be reported as what the agent told the user.
+        let session = parse_lines(
+            r#"{"type":"user","timestamp":"2026-01-01T10:00:00Z","message":{"role":"user","content":"delegate this"}}
+{"type":"assistant","timestamp":"2026-01-01T10:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"main answer"}]}}
+{"type":"user","timestamp":"2026-01-01T10:02:00Z","isSidechain":true,"message":{"role":"user","content":"subagent prompt"}}
+{"type":"assistant","timestamp":"2026-01-01T10:03:00Z","isSidechain":true,"message":{"role":"assistant","content":[{"type":"text","text":"subagent output"}]}}
+"#,
+        );
+        assert_eq!(session.last_assistant_text.as_deref(), Some("main answer"));
+        assert_eq!(
+            session.last_assistant_message_at.map(|t| t.to_rfc3339()),
+            Some("2026-01-01T10:01:00+00:00".to_string())
+        );
+        assert_eq!(
+            session.last_user_message_at.map(|t| t.to_rfc3339()),
+            Some("2026-01-01T10:00:00+00:00".to_string()),
+            "sidechain prompts are not the user's last message either"
+        );
+        assert_eq!(session.message_count, Some(2));
+    }
+
+    #[test]
+    fn unanswered_prompt_leaves_the_assistant_side_empty() {
+        // Ctrl-C or a crash mid-turn: the gap this exposes is the point of the split.
+        let session = parse_lines(
+            r#"{"type":"user","timestamp":"2026-01-01T10:00:00Z","message":{"role":"user","content":"are you there"}}
+"#,
+        );
+        assert!(session.last_user_message_at.is_some());
+        assert!(session.last_assistant_message_at.is_none());
+        assert!(session.last_assistant_text.is_none());
+    }
 
     #[test]
     fn skips_local_command_caveat_meta_messages() {

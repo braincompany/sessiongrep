@@ -63,6 +63,35 @@ pub fn find_repo_root(cwd: &str) -> Option<String> {
     }
 }
 
+/// Split the tail of a conversation by role: when the user last spoke, when the assistant
+/// last replied, and what it said.
+///
+/// A single `last_message_at` cannot distinguish "the agent finished and I walked away" from
+/// "I asked something and never got an answer" — the two look identical, but only the second
+/// means the work was cut off mid-thought.
+///
+/// Providers pass `(role, text, timestamp)` in conversation order.
+pub fn last_exchange(
+    messages: &[(String, String, Option<DateTime<Utc>>)],
+) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>) {
+    let mut last_user_at = None;
+    let mut last_assistant_at = None;
+    let mut last_assistant_text = None;
+    for (role, text, timestamp) in messages {
+        match role.as_str() {
+            "user" => last_user_at = timestamp.or(last_user_at),
+            "assistant" => {
+                last_assistant_at = timestamp.or(last_assistant_at);
+                if !text.trim().is_empty() {
+                    last_assistant_text = Some(text.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    (last_user_at, last_assistant_at, last_assistant_text)
+}
+
 pub fn truncate_for_display(value: &str, max_len: usize) -> String {
     let compact = compact_whitespace(value);
     if compact.len() <= max_len {
@@ -355,6 +384,10 @@ pub fn minimal_record(
             created_at: None,
             updated_at: None,
             last_message_at: None,
+            git_branch: None,
+            last_user_message_at: None,
+            last_assistant_message_at: None,
+            last_assistant_text: None,
             preview_text: "(parse failed)".to_string(),
             source_path: normalize_path(path),
             message_count: Some(0),
