@@ -15,8 +15,6 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 install-path = "CARGO_HOME"
 # Where to host releases
 hosting = "github"
-# Build every artifact on PRs (without publishing) to verify the release pipeline
-pr-run-mode = "upload"
 # Whether to install an updater program
 install-updater = false
 # Archive format for macOS/Linux builds (gzip is available everywhere; xz is not)
