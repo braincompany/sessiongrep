@@ -28,36 +28,31 @@ Only the conversation is indexed: your prompts and the agent's replies. Tool cal
 
 ## Installation
 
-### Prerequisites
+You need session history from at least one of Claude Code, Codex CLI, Cursor, Antigravity, or Pi.
 
-- [Rust toolchain](https://rustup.rs/) 1.88 or newer
-- Session history from at least one of Claude Code, Codex CLI, Cursor, Antigravity, or Pi
-
-### Build and install
+### Prebuilt binaries (macOS, Linux)
 
 ```bash
-cargo install --locked --git https://github.com/braincompany/sessiongrep
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/braincompany/sessiongrep/releases/latest/download/sessiongrep-installer.sh | sh
 ```
 
-Or from a clone:
+The installer picks the build for your platform, verifies its checksum, and adds `~/.cargo/bin` to your PATH if needed. Archives for manual download are on the [releases page](https://github.com/braincompany/sessiongrep/releases).
+
+### With Cargo
+
+Requires a [Rust toolchain](https://rustup.rs/) 1.88 or newer:
 
 ```bash
-git clone https://github.com/braincompany/sessiongrep.git
-cd sessiongrep
-cargo install --locked --path .
+cargo install sessiongrep --locked
 ```
 
-Nix users can install from the flake instead: `nix profile install github:braincompany/sessiongrep`.
+To build the latest `main` instead: `cargo install --locked --git https://github.com/braincompany/sessiongrep`. Nix users can install from the flake: `nix profile install github:braincompany/sessiongrep`.
 
-Either way you get two binaries (Cargo puts them in `~/.cargo/bin/`):
+Every method installs two binaries into `~/.cargo/bin/`:
 - `sessiongrep` — CLI and TUI
 - `sessiongrep-mcp` — MCP server
 
-Make sure `~/.cargo/bin` is in your PATH. Add to your `~/.bashrc` or `~/.zshrc` if not already present:
-
-```bash
-export PATH="$HOME/.cargo/bin:$PATH"
-```
+To upgrade, run the same command again.
 
 ### Index your sessions
 
@@ -170,7 +165,7 @@ prefer_current_repo = true  # rank sessions from the repo you're in higher
 
 ## Status
 
-Early but usable — pre-release, built from source (no tagged release yet). The CLI surface and MCP tool names are likely to stay stable. When an upgrade changes how sessions are parsed, sessiongrep re-parses your session files automatically on the next run.
+Early but usable (v0.1). The CLI surface and MCP tool names are likely to stay stable. When an upgrade changes how sessions are parsed, sessiongrep re-parses your session files automatically on the next run.
 
 ## Contributing
 
