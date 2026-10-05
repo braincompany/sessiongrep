@@ -13,8 +13,6 @@ pub struct Config {
     #[serde(default)]
     pub index: IndexConfig,
     #[serde(default)]
-    pub ui: UiConfig,
-    #[serde(default)]
     pub search: SearchConfig,
 }
 
@@ -43,13 +41,6 @@ pub struct ProviderConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct IndexConfig {
     pub db_path: Option<String>,
-    pub cache_dir: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct UiConfig {
-    #[serde(default = "default_preview_lines")]
-    pub preview_lines: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -65,11 +56,7 @@ fn default_true() -> bool {
 }
 
 fn default_limit() -> usize {
-    50
-}
-
-fn default_preview_lines() -> usize {
-    30
+    25
 }
 
 impl Default for Config {
@@ -83,7 +70,7 @@ impl Default for Config {
                 },
                 codex: ProviderConfig {
                     enabled: true,
-                    paths: vec![home.join(".codex/sessions").to_string_lossy().to_string()],
+                    paths: vec![codex_home().join("sessions").to_string_lossy().to_string()],
                 },
                 cursor: ProviderConfig {
                     enabled: true,
@@ -91,11 +78,17 @@ impl Default for Config {
                 },
                 antigravity: ProviderConfig {
                     enabled: true,
-                    paths: vec![home.join(".gemini/antigravity/brain").to_string_lossy().to_string()],
+                    paths: vec![home
+                        .join(".gemini/antigravity/brain")
+                        .to_string_lossy()
+                        .to_string()],
                 },
                 pi: ProviderConfig {
                     enabled: true,
-                    paths: vec![home.join(".pi/agent/sessions").to_string_lossy().to_string()],
+                    paths: vec![home
+                        .join(".pi/agent/sessions")
+                        .to_string_lossy()
+                        .to_string()],
                 },
             },
             index: IndexConfig {
@@ -104,15 +97,9 @@ impl Default for Config {
                         .to_string_lossy()
                         .to_string(),
                 ),
-                cache_dir: Some(
-                    home.join(".cache/sessiongrep")
-                        .to_string_lossy()
-                        .to_string(),
-                ),
             },
-            ui: UiConfig { preview_lines: 30 },
             search: SearchConfig {
-                default_limit: 50,
+                default_limit: 25,
                 prefer_current_repo: true,
             },
         }
@@ -137,12 +124,6 @@ impl Default for ProviderConfig {
 impl Default for IndexConfig {
     fn default() -> Self {
         Config::default().index
-    }
-}
-
-impl Default for UiConfig {
-    fn default() -> Self {
-        Config::default().ui
     }
 }
 
@@ -183,9 +164,6 @@ impl Config {
         if config.index.db_path.is_none() {
             config.index.db_path = defaults.index.db_path;
         }
-        if config.index.cache_dir.is_none() {
-            config.index.cache_dir = defaults.index.cache_dir;
-        }
         Ok(config)
     }
 
@@ -201,15 +179,6 @@ impl Config {
                 .db_path
                 .as_deref()
                 .unwrap_or("~/.local/share/sessiongrep/index.db"),
-        )
-    }
-
-    pub fn cache_dir(&self) -> PathBuf {
-        expand_tilde(
-            self.index
-                .cache_dir
-                .as_deref()
-                .unwrap_or("~/.cache/sessiongrep"),
         )
     }
 
@@ -259,8 +228,16 @@ impl Config {
     }
 
     pub fn codex_home(&self) -> PathBuf {
-        dirs::home_dir()
+        codex_home()
+    }
+}
+
+/// Codex's data directory: `$CODEX_HOME` if set, else `~/.codex`.
+fn codex_home() -> PathBuf {
+    match std::env::var("CODEX_HOME") {
+        Ok(value) if !value.trim().is_empty() => expand_tilde(value.trim()),
+        _ => dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("~"))
-            .join(".codex")
+            .join(".codex"),
     }
 }

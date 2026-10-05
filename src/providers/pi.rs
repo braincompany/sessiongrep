@@ -5,7 +5,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
 use regex::Regex;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::models::{ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
@@ -267,11 +267,21 @@ mod tests {
         let parsed = adapter.parse(&sources[0]);
         assert_eq!(parsed.session.id, format!("pi:{session_id}"));
         assert_eq!(parsed.session.provider_session_id, session_id);
-        assert_eq!(parsed.session.cwd.as_deref(), Some("/Users/nisarg/src/demo"));
-        assert_eq!(parsed.session.title.as_deref(), Some("Add pi support to sessiongrep"));
+        assert_eq!(
+            parsed.session.cwd.as_deref(),
+            Some("/Users/nisarg/src/demo")
+        );
+        assert_eq!(
+            parsed.session.title.as_deref(),
+            Some("Add pi support to sessiongrep")
+        );
         assert_eq!(parsed.session.message_count, Some(2));
-        assert!(parsed.transcript_text.contains("Add pi support to sessiongrep"));
-        assert!(parsed.transcript_text.contains("I will wire up a pi adapter."));
+        assert!(parsed
+            .transcript_text
+            .contains("Add pi support to sessiongrep"));
+        assert!(parsed
+            .transcript_text
+            .contains("I will wire up a pi adapter."));
         // Thinking and tool payloads stay out of the transcript.
         assert!(!parsed.transcript_text.contains("secret reasoning"));
         assert!(!parsed.transcript_text.contains("toolCall"));

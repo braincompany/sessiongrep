@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::models::{ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
@@ -232,52 +232,58 @@ fn infer_cursor_workspace(path: &Path) -> Option<String> {
     None
 }
 
+/// Filesystem checks allowed per decoded folder name. Real workspace paths need
+/// a few dozen; the cap only bites on trees full of overlapping hyphenated
+/// directory names (`a`, `a-a`, `a-a-a`, ...), where the session gets no cwd.
+const MAX_PATH_PROBES: usize = 4096;
+
+/// Cursor names project folders after the workspace path with `/` replaced by
+/// `-` (e.g. `Users-me-src-my-app`), which is ambiguous when directory names
+/// contain hyphens. Rebuild the path one component at a time, only descending
+/// into directories that exist, within a fixed budget of filesystem checks.
 fn decode_cursor_project_dir(encoded: &str) -> Option<PathBuf> {
-    if encoded == "empty-window" {
+    if encoded.is_empty() || encoded == "empty-window" {
         return None;
     }
+    // Consecutive hyphens yield empty parts; they rejoin into names like `a--b`.
     let parts: Vec<&str> = encoded.split('-').collect();
-    if parts.first().copied() != Some("Users") || parts.len() < 3 {
-        return None;
-    }
-    let suffixes = partition_suffixes(&parts[1..]);
-    suffixes
-        .into_iter()
-        .map(|suffix| {
-            let mut path = PathBuf::from("/");
-            path.push("Users");
-            for part in suffix {
-                path.push(part);
-            }
-            path
-        })
-        .find(|candidate| candidate.exists())
+    let mut budget = MAX_PATH_PROBES;
+    resolve_hyphenated(Path::new("/"), &parts, &mut budget)
 }
 
-fn partition_suffixes(parts: &[&str]) -> Vec<Vec<String>> {
-    fn walk(parts: &[&str], index: usize, current: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
-        if index >= parts.len() {
-            out.push(current.clone());
-            return;
+fn resolve_hyphenated(base: &Path, parts: &[&str], budget: &mut usize) -> Option<PathBuf> {
+    if parts.is_empty() {
+        return Some(base.to_path_buf());
+    }
+    for end in 1..=parts.len() {
+        if *budget == 0 {
+            return None;
         }
-        for end in index + 1..=parts.len() {
-            current.push(parts[index..end].join("-"));
-            walk(parts, end, current, out);
-            current.pop();
+        *budget -= 1;
+        let name = parts[..end].join("-");
+        if name.is_empty() {
+            continue;
+        }
+        let candidate = base.join(name);
+        if end == parts.len() {
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        } else if candidate.is_dir() {
+            if let Some(found) = resolve_hyphenated(&candidate, &parts[end..], budget) {
+                return Some(found);
+            }
         }
     }
-
-    let mut out = Vec::new();
-    walk(parts, 0, &mut Vec::new(), &mut out);
-    out
+    None
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CursorAdapter, cursor_message_text, decode_cursor_project_dir, extract_tag};
+    use super::{cursor_message_text, decode_cursor_project_dir, extract_tag, CursorAdapter};
     use crate::models::Provider;
-    use std::fs;
     use serde_json::json;
+    use std::fs;
     use tempfile::tempdir;
 
     #[test]
@@ -317,14 +323,21 @@ mod tests {
         let parsed = adapter.parse(&sources[0]);
         assert_eq!(parsed.session.id, format!("cursor:{session_id}"));
         assert_eq!(parsed.session.provider_session_id, session_id);
-        assert_eq!(parsed.session.title.as_deref(), Some("Great, add tests too"));
+        assert_eq!(
+            parsed.session.title.as_deref(),
+            Some("Great, add tests too")
+        );
         assert_eq!(
             parsed.session.summary.as_deref(),
             Some("Make Cursor threads searchable")
         );
         assert_eq!(parsed.session.message_count, Some(3));
-        assert!(parsed.transcript_text.contains("Make Cursor threads searchable"));
-        assert!(parsed.transcript_text.contains("I will wire a Cursor provider."));
+        assert!(parsed
+            .transcript_text
+            .contains("Make Cursor threads searchable"));
+        assert!(parsed
+            .transcript_text
+            .contains("I will wire a Cursor provider."));
         assert!(!parsed.transcript_text.contains("ReadFile"));
         assert!(!parsed.transcript_text.contains("subagent"));
     }
@@ -368,5 +381,100 @@ mod tests {
     #[test]
     fn skips_empty_window_workspace() {
         assert!(decode_cursor_project_dir("empty-window").is_none());
+    }
+
+    #[test]
+    fn decodes_hyphenated_workspace_paths_on_any_platform() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path().join("my-app").join("sub").join("deep-er");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::create_dir_all(temp.path().join("my")).expect("decoy dir");
+        let encoded = workspace
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .replace('/', "-");
+
+        assert_eq!(decode_cursor_project_dir(&encoded), Some(workspace));
+        assert_eq!(
+            decode_cursor_project_dir(&format!("{encoded}-missing")),
+            None
+        );
+
+        // Directory names may themselves contain consecutive hyphens.
+        let doubled = temp.path().join("review--x1").join("sub");
+        fs::create_dir_all(&doubled).expect("create doubled-hyphen workspace");
+        let encoded_doubled = doubled
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .replace('/', "-");
+        assert_eq!(decode_cursor_project_dir(&encoded_doubled), Some(doubled));
+
+        // A workspace directly under the filesystem root is a single component.
+        assert_eq!(
+            decode_cursor_project_dir("tmp"),
+            Some(std::path::PathBuf::from("/tmp"))
+        );
+        assert_eq!(decode_cursor_project_dir(""), None);
+
+        // Many hyphens no longer means exponentially many candidates.
+        let long = format!("{}{}", encoded, "-x".repeat(40));
+        assert_eq!(decode_cursor_project_dir(&long), None);
+    }
+
+    #[test]
+    fn path_resolution_stops_when_the_probe_budget_runs_out() {
+        let temp = tempdir().expect("tempdir");
+        let workspace = temp.path().join("my-app").join("sub");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        let encoded = workspace
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .replace('/', "-");
+        let parts: Vec<&str> = encoded.split('-').collect();
+        let root = std::path::Path::new("/");
+
+        let mut budget = super::MAX_PATH_PROBES;
+        assert_eq!(
+            super::resolve_hyphenated(root, &parts, &mut budget),
+            Some(workspace)
+        );
+        assert!(budget < super::MAX_PATH_PROBES);
+
+        let mut tiny = 3;
+        assert_eq!(super::resolve_hyphenated(root, &parts, &mut tiny), None);
+        assert_eq!(tiny, 0);
+    }
+
+    #[test]
+    fn overlapping_hyphenated_directories_exhaust_the_budget() {
+        // Every level holds both `a` and `a-a`, so each way of splitting the
+        // name is a real directory and a dead-end lookup would check them all.
+        let temp = tempdir().expect("tempdir");
+        fn build(dir: &std::path::Path, depth: usize) {
+            if depth == 0 {
+                return;
+            }
+            for name in ["a", "a-a"] {
+                let child = dir.join(name);
+                fs::create_dir_all(&child).expect("create dir");
+                build(&child, depth - 1);
+            }
+        }
+        build(temp.path(), 8);
+        let encoded = format!(
+            "{}{}-missing",
+            temp.path()
+                .to_string_lossy()
+                .trim_start_matches('/')
+                .replace('/', "-"),
+            "-a".repeat(30)
+        );
+        let parts: Vec<&str> = encoded.split('-').collect();
+
+        let mut budget = super::MAX_PATH_PROBES;
+        let found = super::resolve_hyphenated(std::path::Path::new("/"), &parts, &mut budget);
+
+        assert_eq!(found, None);
+        assert_eq!(budget, 0, "search should stop at the probe budget");
     }
 }

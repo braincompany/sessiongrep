@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::models::{ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
-    find_repo_root, format_transcript_line, minimal_record, normalize_path,
-    parse_datetime, preview_from_text, substantive_text, truncate_for_display,
+    find_repo_root, format_transcript_line, minimal_record, normalize_path, parse_datetime,
+    preview_from_text, substantive_text, truncate_for_display,
 };
 
 pub struct AntigravityAdapter {
@@ -67,7 +67,7 @@ impl AntigravityAdapter {
 
     fn parse_inner(&self, path: &Path) -> Result<ParsedSession> {
         let raw = fs::read_to_string(path)?;
-        
+
         // Extract session ID from path. The path structure is:
         // .../brain/<conversation-id>/.system_generated/logs/transcript.jsonl
         // So we traverse up 3 times to get the conversation ID directory name.
@@ -130,7 +130,12 @@ impl AntigravityAdapter {
             }
 
             let source = value.get("source").and_then(Value::as_str).unwrap_or("");
-            let text = value.get("content").and_then(Value::as_str).unwrap_or("").trim().to_string();
+            let text = value
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
 
             if text.is_empty() {
                 continue;
@@ -172,7 +177,7 @@ impl AntigravityAdapter {
             .or_else(|| first_user.clone())
             .map(|text| preview_from_text(&text))
             .unwrap_or_else(|| "(no preview available)".to_string());
-        
+
         let repo_root = cwd.as_deref().and_then(find_repo_root);
         let raw_metadata_json = Some(serde_json::to_string(&json!({
             "line_count": raw.lines().count(),
@@ -215,7 +220,9 @@ mod tests {
     #[test]
     fn test_antigravity_parser() {
         let dir = tempdir().unwrap();
-        let session_dir = dir.path().join("94fc19cc-ad62-42eb-aef9-c43deed34236/.system_generated/logs");
+        let session_dir = dir
+            .path()
+            .join("94fc19cc-ad62-42eb-aef9-c43deed34236/.system_generated/logs");
         fs::create_dir_all(&session_dir).unwrap();
         let log_file = session_dir.join("transcript.jsonl");
 
@@ -230,8 +237,14 @@ mod tests {
         assert_eq!(files.len(), 1);
 
         let parsed = adapter.parse(&files[0]);
-        assert_eq!(parsed.session.provider_session_id, "94fc19cc-ad62-42eb-aef9-c43deed34236");
-        assert_eq!(parsed.session.id, "antigravity:94fc19cc-ad62-42eb-aef9-c43deed34236");
+        assert_eq!(
+            parsed.session.provider_session_id,
+            "94fc19cc-ad62-42eb-aef9-c43deed34236"
+        );
+        assert_eq!(
+            parsed.session.id,
+            "antigravity:94fc19cc-ad62-42eb-aef9-c43deed34236"
+        );
         assert_eq!(parsed.session.cwd.as_deref(), Some("/path/to/repo"));
         assert_eq!(parsed.session.message_count, Some(2));
         assert!(parsed.transcript_text.contains("hello agent"));

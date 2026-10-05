@@ -1,30 +1,44 @@
 use std::fs;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
+use clap::builder::{PossibleValuesParser, RangedU64ValueParser, TypedValueParser};
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
+use crate::tui;
 use sessiongrep::config::Config;
 use sessiongrep::db::Db;
 use sessiongrep::indexer;
 use sessiongrep::models::{Provider, ProviderHealth, SearchFilters, SessionRecord};
 use sessiongrep::providers::{
-    claude::ClaudeAdapter, codex::CodexAdapter, cursor::CursorAdapter, antigravity::AntigravityAdapter,
-    pi::PiAdapter,
+    antigravity::AntigravityAdapter, claude::ClaudeAdapter, codex::CodexAdapter,
+    cursor::CursorAdapter, pi::PiAdapter,
 };
 use sessiongrep::util::{
     current_repo, highlight_matches, normalize_path, parse_datetime, prompt_confirm, relative_age,
     render_command, resume_plan, truncate_for_display, which,
 };
-use crate::tui;
+
+const EXAMPLES: &str = "\
+Examples:
+  sessiongrep search \"auth bug\"              Find sessions about a topic
+  sessiongrep search redis --provider codex  Narrow to one tool
+  sessiongrep list --path ~/src/app          Recent sessions in a repo
+  sessiongrep show 79accec8                  Read a session (ID prefix is enough)
+  sessiongrep resume 79accec8                Continue it in its original tool
+  sessiongrep tui                            Browse interactively
+
+The index updates automatically before each command.";
 
 #[derive(Debug, Parser)]
 #[command(
     name = "sessiongrep",
     version,
-    about = "Search and resume Claude, Codex, Cursor, Antigravity, and Pi session history"
+    about = "Local-first search across Claude Code, Codex, Cursor, Antigravity, and Pi session history",
+    after_help = EXAMPLES
 )]
 struct Cli {
     #[command(subcommand)]
@@ -33,39 +47,56 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Update the index from session files (also runs before every other command)
     Reindex(ReindexArgs),
+    /// List recent sessions, newest first
     List(QueryArgs),
+    /// Search titles, prompts, transcripts, and paths by keyword
     Search(SearchArgs),
+    /// Print a session's metadata and transcript
     Show(ShowArgs),
+    /// Resume a session in its original tool (Claude Code, Codex, or Pi)
     Resume(ResumeArgs),
+    /// Export a session as markdown, text, or JSON
     Export(ExportArgs),
+    /// Check provider paths, CLIs, and index health
     Doctor,
+    /// Print the config, index, and provider paths in use
     Paths,
+    /// Browse and search sessions interactively
     Tui,
 }
 
 #[derive(Debug, Args)]
 struct ReindexArgs {
+    /// Rebuild from scratch. Sessions whose source files no longer exist
+    /// (e.g. removed by Claude Code's 30-day cleanup) are dropped
     #[arg(long)]
     full: bool,
 }
 
 #[derive(Debug, Args, Clone)]
 struct QueryArgs {
-    #[arg(long)]
+    /// Only sessions from this tool
+    #[arg(long, value_parser = provider_parser(), ignore_case = true)]
     provider: Option<Provider>,
+    /// Only sessions whose working directory or repo root starts with this path
     #[arg(long)]
     path: Option<String>,
+    /// Only sessions updated on or after this date (YYYY-MM-DD or RFC 3339)
     #[arg(long)]
     since: Option<String>,
-    #[arg(long, default_value_t = 25)]
-    limit: usize,
+    /// Maximum number of results [default: search.default_limit in config, 25]
+    #[arg(long, value_parser = RangedU64ValueParser::<usize>::new().range(1..=10_000))]
+    limit: Option<usize>,
+    /// Only sessions that had parse warnings
     #[arg(long)]
     warnings_only: bool,
 }
 
 #[derive(Debug, Args)]
 struct SearchArgs {
+    /// Words to search for; partial words and small typos match
     query: String,
     #[command(flatten)]
     filters: QueryArgs,
@@ -73,33 +104,45 @@ struct SearchArgs {
 
 #[derive(Debug, Args)]
 struct ShowArgs {
+    /// Session ID or unique prefix (e.g. claude:79accec8 or 79accec8)
     id: String,
+    /// Omit the "Transcript" heading before the transcript
     #[arg(long)]
     raw: bool,
 }
 
 #[derive(Debug, Args)]
 struct ResumeArgs {
+    /// Session ID or unique prefix
     id: String,
+    /// Run the resume command without asking for confirmation
     #[arg(long)]
     yes: bool,
+    /// Print the resume command without running it
     #[arg(long)]
     dry_run: bool,
 }
 
 #[derive(Debug, Args)]
 struct ExportArgs {
+    /// Session ID or unique prefix
     id: String,
-    #[arg(long, default_value = "markdown")]
+    /// Output format
+    #[arg(long, default_value = "markdown", value_parser = ["markdown", "md", "text", "json"])]
     format: String,
+    /// Write to this file instead of stdout
     #[arg(short, long)]
     output: Option<PathBuf>,
+}
+
+fn provider_parser() -> impl TypedValueParser<Value = Provider> {
+    PossibleValuesParser::new(["claude", "codex", "cursor", "antigravity", "pi"])
+        .map(|value| value.parse().expect("possible values are valid providers"))
 }
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::load()?;
-    fs::create_dir_all(config.cache_dir())?;
     let db = Db::open(&config.db_path())?;
 
     // Auto-reindex (incremental) before commands that read session data
@@ -183,7 +226,8 @@ pub fn run() -> Result<()> {
 }
 
 fn reindex(config: &Config, db: &Db, full: bool, quiet: bool) -> Result<(usize, usize)> {
-    if quiet {
+    // Progress uses carriage returns, so only draw it on an interactive terminal.
+    if quiet || !std::io::stderr().is_terminal() {
         return indexer::reindex(config, db, full, None);
     }
 
@@ -218,11 +262,7 @@ fn build_filters(args: &QueryArgs, config: &Config) -> Result<SearchFilters> {
             })?),
             None => None,
         },
-        limit: if args.limit == 0 {
-            config.search.default_limit
-        } else {
-            args.limit
-        },
+        limit: args.limit.unwrap_or(config.search.default_limit).max(1),
         warnings_only: args.warnings_only,
     })
 }
@@ -328,8 +368,10 @@ fn print_session_detail(session: &SessionRecord) {
     }
 }
 
-
-fn export_session(session: &sessiongrep::models::SessionWithTranscript, format: &str) -> Result<String> {
+fn export_session(
+    session: &sessiongrep::models::SessionWithTranscript,
+    format: &str,
+) -> Result<String> {
     match format {
         "text" => Ok(format!(
             "{}\n\n{}\n",
@@ -457,7 +499,6 @@ fn print_doctor(config: &Config, db: &Db) -> Result<()> {
 fn print_paths(config: &Config) {
     println!("Config: {}", Config::config_path().display());
     println!("DB: {}", config.db_path().display());
-    println!("Cache: {}", config.cache_dir().display());
     println!(
         "Claude roots: {}",
         config
@@ -505,4 +546,3 @@ fn print_paths(config: &Config) {
     );
     println!("Codex metadata home: {}", config.codex_home().display());
 }
-

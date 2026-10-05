@@ -5,15 +5,15 @@ use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
-    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    Terminal,
 };
 
 use sessiongrep::config::Config;
@@ -122,7 +122,7 @@ fn run_app(
                 }
                 KeyCode::Enter | KeyCode::Char('r') => {
                     if let Some(selected) = app.selected_session() {
-                        return Ok(AppAction::Resume(selected.clone()));
+                        return Ok(AppAction::Resume(Box::new(selected.clone())));
                     }
                 }
                 _ => {}
@@ -133,7 +133,7 @@ fn run_app(
 
 enum AppAction {
     Quit,
-    Resume(SessionRecord),
+    Resume(Box<SessionRecord>),
 }
 
 struct AppState<'a> {
@@ -251,11 +251,7 @@ impl<'a> AppState<'a> {
             self.results.len()
         );
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(list_title),
-            )
+            .block(Block::default().borders(Borders::ALL).title(list_title))
             .highlight_style(
                 Style::default()
                     .fg(Color::Yellow)
@@ -317,8 +313,8 @@ impl<'a> AppState<'a> {
         if self.results.is_empty() {
             return Ok(());
         }
-        let new = (self.selected as isize + delta)
-            .clamp(0, self.results.len() as isize - 1) as usize;
+        let new =
+            (self.selected as isize + delta).clamp(0, self.results.len() as isize - 1) as usize;
         if new != self.selected {
             self.selected = new;
             self.preview_scroll = 0;
@@ -479,7 +475,10 @@ fn build_transcript_summary(transcript: &str) -> String {
         if let Some(prev) = last_emitted_idx {
             if *idx > prev + 1 {
                 let gap = *idx - prev - 1;
-                parts.push(format!("⋯ {gap} more turn{} hidden ⋯", if gap == 1 { "" } else { "s" }));
+                parts.push(format!(
+                    "⋯ {gap} more turn{} hidden ⋯",
+                    if gap == 1 { "" } else { "s" }
+                ));
             }
         }
         parts.push((*label).to_string());
@@ -489,13 +488,18 @@ fn build_transcript_summary(transcript: &str) -> String {
 
     if hidden > 0 && sections.len() < 2 {
         // Single section displayed but more turns exist after it (rare edge case).
-        parts.push(format!("⋯ {hidden} more turn{} hidden ⋯", if hidden == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "⋯ {hidden} more turn{} hidden ⋯",
+            if hidden == 1 { "" } else { "s" }
+        ));
     }
 
-    parts.push(format!("({total} turn{} total)", if total == 1 { "" } else { "s" }));
+    parts.push(format!(
+        "({total} turn{} total)",
+        if total == 1 { "" } else { "s" }
+    ));
     parts.join("\n\n")
 }
-
 
 fn render_preview_line(line: &str, query: &str) -> Line<'static> {
     if let Some(session_id) = line.strip_prefix("Session: ") {
@@ -536,9 +540,13 @@ fn render_preview_line(line: &str, query: &str) -> Line<'static> {
 
     if line.starts_with("── ") {
         let style = if line.contains("prompt") {
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD)
         };
         return Line::from(Span::styled(line.to_string(), style));
     }
@@ -546,7 +554,9 @@ fn render_preview_line(line: &str, query: &str) -> Line<'static> {
     if line.starts_with("⋯ ") || line.starts_with('(') && line.ends_with(" total)") {
         return Line::from(Span::styled(
             line.to_string(),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         ));
     }
 
@@ -666,7 +676,10 @@ mod tests {
 
     #[test]
     fn summary_truncates_long_body() {
-        let big_body: String = (0..30).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let big_body: String = (0..30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let raw = join_turns(&[("user", &big_body), ("assistant", "ok")]);
         let summary = build_transcript_summary(&raw);
         assert!(summary.contains("[…]"));

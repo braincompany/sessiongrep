@@ -1,19 +1,20 @@
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
 use regex::Regex;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::models::{ParsedSession, Provider, SessionRecord, SourceFile};
 use crate::util::{
-    extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
-    parse_datetime, parse_unix_seconds, preview_from_text, truncate_for_display,
+    consists_of_tag_blocks, extract_text, find_repo_root, format_transcript_line, minimal_record,
+    normalize_path, parse_datetime, parse_unix_seconds, preview_from_text, truncate_for_display,
 };
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -35,7 +36,9 @@ pub struct CodexAdapter {
 
 impl CodexAdapter {
     pub fn new(roots: Vec<PathBuf>, codex_home: PathBuf) -> Self {
-        let threads = load_threads(&codex_home.join("state_5.sqlite")).unwrap_or_default();
+        let threads = latest_state_db(&codex_home)
+            .and_then(|path| load_threads(&path).ok())
+            .unwrap_or_default();
         let index_titles =
             load_index_titles(&codex_home.join("session_index.jsonl")).unwrap_or_default();
         Self {
@@ -83,10 +86,17 @@ impl CodexAdapter {
         files
     }
 
-    pub fn parse(&self, source: &SourceFile) -> ParsedSession {
+    /// Parse a rollout file. Returns `None` for sub-agent sessions (guardian
+    /// reviews, spawned agents): they replay their parent's history and would
+    /// duplicate it in search results.
+    pub fn parse(&self, source: &SourceFile) -> Option<ParsedSession> {
         match self.parse_inner(&source.path) {
             Ok(parsed) => parsed,
-            Err(err) => minimal_record(Provider::Codex, &source.path, err.to_string()),
+            Err(err) => Some(minimal_record(
+                Provider::Codex,
+                &source.path,
+                err.to_string(),
+            )),
         }
     }
 
@@ -103,8 +113,11 @@ impl CodexAdapter {
         stable_fingerprint(&bytes)
     }
 
-    fn parse_inner(&self, path: &Path) -> Result<ParsedSession> {
-        let raw = fs::read_to_string(path)?;
+    fn parse_inner(&self, path: &Path) -> Result<Option<ParsedSession>> {
+        // Stream the rollout: sub-agents are recognised from the first line, so
+        // their (often large) replayed history is never read.
+        let reader = BufReader::new(File::open(path)?);
+        let mut line_count = 0usize;
         let mut provider_session_id = self
             .extract_id(path)
             .unwrap_or_else(|| "unknown".to_string());
@@ -116,11 +129,13 @@ impl CodexAdapter {
         let mut first_user = None;
         let mut last_user = None;
 
-        for line in raw.lines() {
+        for line in reader.lines() {
+            let line = line?;
+            line_count += 1;
             if line.trim().is_empty() {
                 continue;
             }
-            let value: Value = match serde_json::from_str(line) {
+            let value: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
                 Err(_) => continue,
             };
@@ -131,6 +146,14 @@ impl CodexAdapter {
             match value.get("type").and_then(Value::as_str) {
                 Some("session_meta") => {
                     if let Some(payload) = value.get("payload") {
+                        // Codex marks sub-agents with source.subagent and links them to
+                        // their parent; either marker is enough.
+                        let has_parent = payload
+                            .get("parent_thread_id")
+                            .is_some_and(|parent| !parent.is_null());
+                        if has_parent || payload.pointer("/source/subagent").is_some() {
+                            return Ok(None);
+                        }
                         if let Some(id) = payload.get("id").and_then(Value::as_str) {
                             provider_session_id = id.to_string();
                         }
@@ -155,7 +178,7 @@ impl CodexAdapter {
                         if item_type == Some("message")
                             && matches!(role, Some("user" | "assistant"))
                         {
-                            let text = extract_text(payload);
+                            let text = message_text(payload);
                             if text.trim().is_empty() {
                                 continue;
                             }
@@ -206,7 +229,7 @@ impl CodexAdapter {
             .map(|text| preview_from_text(&text))
             .unwrap_or_else(|| "(no preview available)".to_string());
         let raw_metadata_json = Some(serde_json::to_string(&json!({
-            "line_count": raw.lines().count(),
+            "line_count": line_count,
             "rollout_path": meta.rollout_path,
             "session_path": normalize_path(path),
         }))?);
@@ -225,16 +248,16 @@ impl CodexAdapter {
             preview_text: preview,
             source_path: normalize_path(path),
             message_count: Some(message_count),
-            parse_version: "codex-v2".to_string(),
+            parse_version: "codex-v3".to_string(),
             raw_metadata_json,
             parse_warning: None,
             discovery_source: "jsonl+sqlite".to_string(),
         };
 
-        Ok(ParsedSession {
+        Ok(Some(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),
-        })
+        }))
     }
 
     fn extract_id(&self, path: &Path) -> Option<String> {
@@ -246,6 +269,41 @@ impl CodexAdapter {
     }
 }
 
+/// Tags of context Codex injects into the conversation as user-role messages:
+/// environment details, instructions, and turn bookkeeping. None of it was
+/// typed by the user.
+const INJECTED_TAGS: &[&str] = &[
+    "environment_context",
+    "user_instructions",
+    "permissions instructions",
+    "recommended_plugins",
+    "turn_aborted",
+];
+
+/// Whether a content item is injected context rather than user text: nothing
+/// but complete injected tag blocks, or an AGENTS.md block (which would
+/// otherwise match every session in its repo). A prompt that merely starts
+/// with one of these tags is kept.
+fn is_injected(text: &str) -> bool {
+    let agents_md = text.starts_with("# AGENTS.md instructions for ")
+        && text.trim_end().ends_with("</INSTRUCTIONS>");
+    agents_md || consists_of_tag_blocks(text, INJECTED_TAGS)
+}
+
+/// Text of a Codex message item, minus injected context blocks.
+fn message_text(payload: &Value) -> String {
+    let Some(items) = payload.get("content").and_then(Value::as_array) else {
+        return extract_text(payload);
+    };
+    items
+        .iter()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty() && !is_injected(text))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn stable_fingerprint(bytes: &[u8]) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in bytes {
@@ -255,11 +313,73 @@ fn stable_fingerprint(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
+/// Codex keeps thread metadata in `state_<N>.sqlite`, bumping N on schema
+/// changes. Use the highest version present.
+fn latest_state_db(codex_home: &Path) -> Option<PathBuf> {
+    let state_re = Regex::new(r"^state_(\d+)\.sqlite$").expect("valid regex");
+    fs::read_dir(codex_home)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let version: u32 = state_re.captures(name.to_str()?)?[1].parse().ok()?;
+            Some((version, entry.path()))
+        })
+        .max_by_key(|(version, _)| *version)
+        .map(|(_, path)| path)
+}
+
+/// Read Codex's thread table without creating or changing files in its directory.
+///
+/// While Codex runs, its database is in WAL mode with `-wal`/`-shm` files beside
+/// it; a read-only connection shares them and sees uncheckpointed writes. When
+/// they're absent, every write is in the main file, and SQLite must not create
+/// them (a read-only connection would, and leave them behind), so open it
+/// immutable instead. Immutable reads take no locks, so if Codex starts while
+/// we read, the snapshot may be stale; read again through its WAL.
 fn load_threads(path: &Path) -> Result<HashMap<String, CodexMetadata>> {
-    if !path.exists() {
-        return Ok(HashMap::new());
+    let read_only = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let wal_in_use = || {
+        ["-wal", "-shm"].iter().all(|suffix| {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            PathBuf::from(name).exists()
+        })
+    };
+    if !wal_in_use() {
+        let uri = immutable_uri(&path.to_string_lossy(), cfg!(windows));
+        let result = Connection::open_with_flags(uri, read_only | OpenFlags::SQLITE_OPEN_URI)
+            .map_err(anyhow::Error::from)
+            .and_then(|conn| query_threads(&conn));
+        if !wal_in_use() {
+            return result;
+        }
     }
-    let conn = Connection::open(path)?;
+    query_threads(&Connection::open_with_flags(path, read_only)?)
+}
+
+/// SQLite URI opening `path` immutably. Absolute paths get an empty authority
+/// (`file:///...`) so a path starting with `//` isn't read as a host name, and
+/// Windows paths use forward slashes with a leading `/` before the drive.
+fn immutable_uri(path: &str, windows: bool) -> String {
+    let mut escaped = String::new();
+    for ch in path.chars() {
+        match ch {
+            '%' => escaped.push_str("%25"),
+            '?' => escaped.push_str("%3f"),
+            '#' => escaped.push_str("%23"),
+            '\\' if windows => escaped.push('/'),
+            _ => escaped.push(ch),
+        }
+    }
+    if windows && escaped.as_bytes().get(1) == Some(&b':') {
+        escaped.insert(0, '/');
+    }
+    let authority = if escaped.starts_with('/') { "//" } else { "" };
+    format!("file:{authority}{escaped}?immutable=1")
+}
+
+fn query_threads(conn: &Connection) -> Result<HashMap<String, CodexMetadata>> {
     let mut stmt = conn.prepare(
         "select id, title, cwd, created_at, updated_at, rollout_path, first_user_message from threads",
     )?;
@@ -314,7 +434,7 @@ fn load_index_titles(path: &Path) -> Result<HashMap<String, String>> {
 #[cfg(test)]
 mod tests {
     use super::CodexAdapter;
-    use rusqlite::{Connection, params};
+    use rusqlite::{params, Connection};
     use std::fs;
     use tempfile::tempdir;
 
@@ -322,9 +442,7 @@ mod tests {
 
     fn write_rollout(root: &std::path::Path) -> std::path::PathBuf {
         fs::create_dir_all(root).unwrap();
-        let path = root.join(format!(
-            "rollout-2026-08-01T12-00-00-{SESSION_ID}.jsonl"
-        ));
+        let path = root.join(format!("rollout-2026-08-01T12-00-00-{SESSION_ID}.jsonl"));
         fs::write(
             &path,
             format!(
@@ -335,6 +453,205 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    #[test]
+    fn injected_context_is_not_treated_as_user_turns() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(format!("rollout-2026-08-01T12-00-00-{SESSION_ID}.jsonl"));
+        let user = |texts: &[&str]| {
+            let content: Vec<_> = texts
+                .iter()
+                .map(|text| serde_json::json!({"type": "input_text", "text": text}))
+                .collect();
+            serde_json::json!({"timestamp": "2026-08-01T12:00:01Z", "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": content}})
+            .to_string()
+        };
+        let lines = [
+            user(&["# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>AGENTS BODY</INSTRUCTIONS>"]),
+            user(&["<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"]),
+            user(&["Investigate the flaky test"]),
+            user(&["<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>"]),
+        ];
+        fs::write(&path, lines.join("\n")).unwrap();
+
+        let adapter = CodexAdapter::new(vec![root], temp.path().join("codex-home"));
+        let parsed = adapter.parse(&adapter.discover()[0]).unwrap();
+
+        assert!(!parsed.transcript_text.contains("AGENTS BODY"));
+        assert!(!parsed.transcript_text.contains("environment_context"));
+        assert!(!parsed.transcript_text.contains("interrupted"));
+        assert_eq!(parsed.session.message_count, Some(1));
+        assert_eq!(
+            parsed.session.title.as_deref(),
+            Some("Investigate the flaky test")
+        );
+        assert_eq!(parsed.session.preview_text, "Investigate the flaky test");
+    }
+
+    #[test]
+    fn subagent_sessions_are_skipped() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(format!("rollout-2026-08-01T12-00-00-{SESSION_ID}.jsonl"));
+        fs::write(
+            &path,
+            format!(
+                r#"{{"timestamp":"2026-08-01T12:00:00Z","type":"session_meta","payload":{{"id":"{SESSION_ID}","parent_thread_id":"parent","source":{{"subagent":{{"other":"guardian"}}}}}}}}
+{{"timestamp":"2026-08-01T12:00:01Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"The following is the Codex agent history"}}]}}}}
+"#
+            ),
+        )
+        .unwrap();
+
+        let adapter = CodexAdapter::new(vec![root.clone()], temp.path().join("codex-home"));
+        assert!(adapter.parse(&adapter.discover()[0]).is_none());
+
+        // A parent link alone also marks a sub-agent.
+        fs::write(
+            &path,
+            format!(
+                r#"{{"timestamp":"2026-08-01T12:00:00Z","type":"session_meta","payload":{{"id":"{SESSION_ID}","parent_thread_id":"parent","source":"vscode"}}}}
+{{"timestamp":"2026-08-01T12:00:01Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"replayed parent history"}}]}}}}
+"#
+            ),
+        )
+        .unwrap();
+        let adapter = CodexAdapter::new(vec![root.clone()], temp.path().join("codex-home"));
+        assert!(adapter.parse(&adapter.discover()[0]).is_none());
+
+        // The rest of a sub-agent rollout is never read: bytes that aren't valid
+        // UTF-8 after the first line would otherwise surface as a parse failure.
+        let mut bytes = format!(
+            r#"{{"timestamp":"2026-08-01T12:00:00Z","type":"session_meta","payload":{{"id":"{SESSION_ID}","source":{{"subagent":"guardian"}}}}}}"#
+        )
+        .into_bytes();
+        bytes.extend_from_slice(b"\n\xff\xfe not utf-8\n");
+        fs::write(&path, bytes).unwrap();
+        let adapter = CodexAdapter::new(vec![root], temp.path().join("codex-home"));
+        assert!(adapter.parse(&adapter.discover()[0]).is_none());
+    }
+
+    #[test]
+    fn reads_wal_state_db_without_writing_to_it() {
+        let temp = tempdir().unwrap();
+        write_state_db(temp.path());
+        let db = temp.path().join("state_5.sqlite");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch("pragma journal_mode = wal").unwrap();
+        }
+        // Last connection closed: SQLite removed -wal/-shm, as when Codex isn't running.
+        assert!(!temp.path().join("state_5.sqlite-shm").exists());
+        let before = fs::read(&db).unwrap();
+
+        let threads = super::load_threads(&db).unwrap();
+
+        assert!(threads.contains_key(SESSION_ID));
+        assert_eq!(fs::read(&db).unwrap(), before);
+        let mut names: Vec<_> = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["state_5.sqlite"]);
+    }
+
+    #[test]
+    fn reads_uncheckpointed_writes_while_codex_holds_the_db_open() {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join("state_5.sqlite");
+        let codex = Connection::open(&db).unwrap();
+        codex
+            .execute_batch(
+                "pragma journal_mode = wal; pragma wal_autocheckpoint = 0;
+                 create table threads (id text primary key, title text, cwd text,
+                     created_at integer, updated_at integer, rollout_path text,
+                     first_user_message text);
+                 insert into threads (id, title) values ('live', 'Only in the WAL');",
+            )
+            .unwrap();
+
+        let threads = super::load_threads(&db).unwrap();
+
+        assert_eq!(
+            threads.get("live").and_then(|meta| meta.title.as_deref()),
+            Some("Only in the WAL")
+        );
+        drop(codex);
+    }
+
+    #[test]
+    fn reads_state_db_under_a_double_slash_path() {
+        let temp = tempdir().unwrap();
+        write_state_db(temp.path());
+        let doubled =
+            std::path::PathBuf::from(format!("/{}", temp.path().display())).join("state_5.sqlite");
+        assert!(super::load_threads(&doubled)
+            .unwrap()
+            .contains_key(SESSION_ID));
+    }
+
+    #[test]
+    fn immutable_uris_handle_unix_and_windows_paths() {
+        use super::immutable_uri;
+        assert_eq!(
+            immutable_uri("/home/me/state_5.sqlite", false),
+            "file:///home/me/state_5.sqlite?immutable=1"
+        );
+        assert_eq!(
+            immutable_uri("//odd/path#1?.sqlite", false),
+            "file:////odd/path%231%3f.sqlite?immutable=1"
+        );
+        assert_eq!(
+            immutable_uri(r"C:\Users\me\.codex\state_5.sqlite", true),
+            "file:///C:/Users/me/.codex/state_5.sqlite?immutable=1"
+        );
+        // Backslashes are ordinary filename characters on Unix.
+        assert_eq!(
+            immutable_uri(r"rel\x.sqlite", false),
+            r"file:rel\x.sqlite?immutable=1"
+        );
+    }
+
+    #[test]
+    fn prompts_that_only_start_with_an_injected_tag_are_kept() {
+        assert!(super::is_injected(
+            "<turn_aborted>\nThe user interrupted.\n</turn_aborted>"
+        ));
+        assert!(super::is_injected(
+            "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS>"
+        ));
+        assert!(!super::is_injected(
+            "<environment_context> -- what is this tag?"
+        ));
+        assert!(!super::is_injected(
+            "<turn_aborted>x</turn_aborted> why did my turn abort?"
+        ));
+        assert!(!super::is_injected(
+            "# AGENTS.md instructions for /repo: should I add one?"
+        ));
+    }
+
+    #[test]
+    fn picks_the_newest_state_db_version() {
+        let temp = tempdir().unwrap();
+        for name in [
+            "state_5.sqlite",
+            "state_12.sqlite",
+            "state_9.sqlite-wal",
+            "logs_20.sqlite",
+        ] {
+            fs::write(temp.path().join(name), "").unwrap();
+        }
+        assert_eq!(
+            super::latest_state_db(temp.path()),
+            Some(temp.path().join("state_12.sqlite"))
+        );
     }
 
     fn write_state_db(home: &std::path::Path) {
@@ -395,7 +712,7 @@ mod tests {
 
         let adapter = CodexAdapter::new(vec![sessions], home.to_path_buf());
         let sources = adapter.discover();
-        let parsed = adapter.parse(&sources[0]);
+        let parsed = adapter.parse(&sources[0]).unwrap();
 
         assert_eq!(
             parsed.session.title.as_deref(),
@@ -415,7 +732,7 @@ mod tests {
 
         let adapter = CodexAdapter::new(vec![sessions], home.to_path_buf());
         let sources = adapter.discover();
-        let parsed = adapter.parse(&sources[0]);
+        let parsed = adapter.parse(&sources[0]).unwrap();
 
         assert_eq!(
             parsed.session.title.as_deref(),
@@ -447,4 +764,3 @@ mod tests {
         assert_ne!(old_fingerprint, new_fingerprint);
     }
 }
-

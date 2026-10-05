@@ -24,24 +24,32 @@ Session transcripts already live on your machine — scattered across `~/.claude
 
 Provider adapters normalize Claude, Codex, Cursor, Antigravity, and Pi transcripts into a single `Session` model and write them into SQLite (WAL mode) with an FTS5 virtual table over transcript text, title, summary, and preview. Every read command runs an incremental reindex first — files whose mtime and size haven't changed are skipped, so search and list stay fast even as your history grows.
 
+Only the conversation is indexed: your prompts and the agent's replies. Tool calls and their output, injected context (AGENTS.md, skill bodies, system reminders), and sub-agent transcripts are left out, so a hit points at what was discussed rather than at every file an agent happened to read. Titles come from each tool's own session names where they exist (Claude Code's `/rename` and generated titles, Codex thread names), falling back to the first prompt.
+
 ## Installation
 
 ### Prerequisites
 
-- [Rust toolchain](https://rustup.rs/) (1.70+)
-- Claude Code, Codex CLI, and/or Cursor installed (for session data)
+- [Rust toolchain](https://rustup.rs/) 1.88 or newer
+- Session history from at least one of Claude Code, Codex CLI, Cursor, Antigravity, or Pi
 
 ### Build and install
 
 ```bash
-git clone git@github.com:braincompany/sessiongrep.git
-cd sessiongrep
-
-# Install both binaries
-cargo install --path .
+cargo install --locked --git https://github.com/braincompany/sessiongrep
 ```
 
-This installs two binaries to `~/.cargo/bin/`:
+Or from a clone:
+
+```bash
+git clone https://github.com/braincompany/sessiongrep.git
+cd sessiongrep
+cargo install --locked --path .
+```
+
+Nix users can install from the flake instead: `nix profile install github:braincompany/sessiongrep`.
+
+Either way you get two binaries (Cargo puts them in `~/.cargo/bin/`):
 - `sessiongrep` — CLI and TUI
 - `sessiongrep-mcp` — MCP server
 
@@ -55,7 +63,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 
 The index updates automatically — every command (search, list, tui, etc.) runs an incremental reindex before executing. No cron jobs or manual steps needed.
 
-To force a full rebuild from scratch:
+To force a full rebuild from scratch (see [Privacy & data](#privacy--data) for what this drops):
 
 ```bash
 sessiongrep reindex --full
@@ -74,7 +82,10 @@ sessiongrep resume 79accec8 --dry-run
 sessiongrep export 79accec8 --format markdown
 sessiongrep doctor                 # health check
 sessiongrep tui                    # interactive browser
+sessiongrep --help                 # every command and flag
 ```
+
+Search matches whole words, partial words (`sqli` finds `sqlite`), and small typos in titles and paths, then ranks results by where the match landed, how recent the session is, and whether it belongs to the repo you're in.
 
 ## MCP server setup
 
@@ -105,14 +116,14 @@ The agent will call `search_sessions` to find matches and `get_session` to pull 
 | Tool | Description |
 |------|-------------|
 | `search_sessions` | Search sessions by keyword, with optional provider filter and limit |
-| `get_session` | Get full transcript and metadata by session ID (supports `max_lines` to limit context) |
+| `get_session` | Get a session's transcript and metadata by ID or prefix. Long transcripts are paged (~40k characters by default) with `offset`, `char_offset`, `max_lines`, and `max_chars` |
 | `list_sessions` | List recent sessions, filterable by provider and path prefix |
 | `timeline_for_repo` | Day-bucketed metadata timeline for a repo path prefix — scoped view of what changed over time |
 | `get_resume_command` | Get the CLI command to resume a session in its native tool |
 
 ## Config
 
-Optional config file at `~/.config/sessiongrep/config.toml`:
+Optional config file at `~/.config/sessiongrep/config.toml`. Every key is optional; these are the defaults:
 
 ```toml
 [providers.claude]
@@ -121,7 +132,7 @@ paths = ["~/.claude/projects"]
 
 [providers.codex]
 enabled = true
-paths = ["~/.codex/sessions"]
+paths = ["~/.codex/sessions"]  # or $CODEX_HOME/sessions when CODEX_HOME is set
 
 [providers.cursor]
 enabled = true
@@ -137,31 +148,29 @@ paths = ["~/.pi/agent/sessions"]
 
 [index]
 db_path = "~/.local/share/sessiongrep/index.db"
-cache_dir = "~/.cache/sessiongrep"
-
-[ui]
-preview_lines = 30
 
 [search]
-default_limit = 50
-prefer_current_repo = true
+default_limit = 25          # results for list/search when --limit isn't given
+prefer_current_repo = true  # rank sessions from the repo you're in higher
 ```
 
 ## Privacy & data
 
 - Everything stays on your machine. No network calls, no telemetry, no cloud sync.
-- The tool is read-only — it never modifies your session files.
-- The SQLite index is a derived cache. Delete it anytime and `reindex --full` rebuilds it from your transcripts.
-- All paths (database, cache, config) are user-local under `~/.local/share`, `~/.cache`, and `~/.config`.
+- The tool is read-only: it never writes to your session files or to the tools' own databases.
+- The SQLite index at `~/.local/share/sessiongrep/index.db` is built from your transcripts and can be deleted anytime.
+- The index keeps sessions whose source files have since been deleted, so they stay searchable. Claude Code, for example, removes transcripts 30 days after their last activity by default (its `cleanupPeriodDays` setting). Deleting the index or running `reindex --full` rebuilds it from the files still on disk and drops those sessions.
+- The database and config live under `~/.local/share` and `~/.config`.
 
 ## Limitations
 
-- Resume delegates to the native provider CLI (`claude --resume <id>`, `codex resume <id>`, or `pi --session <id>`). Cursor and Antigravity resume are not currently supported.
-- Claude, Cursor, and Pi subagent transcripts are excluded from indexing to avoid duplicate records.
+- Resume delegates to the native provider CLI (`claude --resume <id>`, `codex resume <id>`, or `pi --session <id>`). Cursor and Antigravity resume are not currently supported, and a session whose transcript file has been deleted can be searched but not resumed.
+- Sub-agent transcripts (Claude, Codex, Cursor, and Pi) are excluded from indexing to avoid duplicate records.
+- Search is keyword-based (SQLite FTS5 plus fuzzy matching on titles and paths); there is no semantic or embedding search.
 
 ## Status
 
-Early but usable — pre-release, built from source (no tagged release yet). The CLI surface and MCP tool names are likely to stay stable; the on-disk index schema may still change (delete `~/.local/share/sessiongrep/index.db` and let it rebuild if you hit a schema mismatch).
+Early but usable — pre-release, built from source (no tagged release yet). The CLI surface and MCP tool names are likely to stay stable. When an upgrade changes how sessions are parsed, sessiongrep re-parses your session files automatically on the next run.
 
 ## Contributing
 
