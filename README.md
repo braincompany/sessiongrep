@@ -9,7 +9,7 @@ A local-first memory layer for CLI agents. `sessiongrep` indexes your Claude Cod
 
 The real payoff is portable context: your session history isn't trapped in one tool. Work you started in Claude Code can continue in Codex, and an agent can recover — and even critique — its own prior reasoning across every tool you use.
 
-![sessiongrep demo](docs/demo.gif)
+![sessiongrep demo](https://raw.githubusercontent.com/braincompany/sessiongrep/main/docs/demo.gif)
 <!-- Demo GIF is generated from sanitized sample data (generation scripts kept outside the repo). -->
 
 Read the announcement: [Sessiongrep: a local-first memory layer for CLI agents](https://brain.co/blog/sessiongrep-a-local-first-memory-layer-for-cli-agents).

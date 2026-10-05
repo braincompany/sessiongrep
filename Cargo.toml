@@ -1,6 +1,6 @@
 [package]
 name = "sessiongrep"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 edition = "2021"
 rust-version = "1.88"
 description = "Local-first memory layer for CLI agents: search, inspect, export, and resume Claude Code, Codex CLI, Cursor, Antigravity, and Pi sessions, with an MCP server for agent-driven recall."
@@ -9,6 +9,7 @@ repository = "https://github.com/braincompany/sessiongrep"
 readme = "README.md"
 keywords = ["cli", "search", "mcp", "claude-code", "codex"]
 categories = ["command-line-utilities", "development-tools"]
+include = ["src/**/*.rs", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "CHANGELOG.md"]
 
 [dependencies]
 anyhow = "1.0"
@@ -40,3 +41,8 @@ path = "src/mcp.rs"
 
 [dev-dependencies]
 tempfile = "3.23"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
