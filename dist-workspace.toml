@@ -15,5 +15,14 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 install-path = "CARGO_HOME"
 # Where to host releases
 hosting = "github"
+# Build every artifact on PRs (without publishing) to verify the release pipeline
+pr-run-mode = "upload"
 # Whether to install an updater program
 install-updater = false
+# Archive format for macOS/Linux builds (gzip is available everywhere; xz is not)
+unix-archive = ".tar.gz"
+
+# GitHub's Intel macOS runners (macos-15-intel) weren't available to this repo,
+# so cross-compile the Intel build on the Apple Silicon runner instead.
+[dist.github-custom-runners]
+x86_64-apple-darwin = "macos-14"
