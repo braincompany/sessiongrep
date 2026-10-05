@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Utc};
 use regex::RegexBuilder;
 use serde_json::Value;
@@ -222,6 +222,31 @@ pub fn substantive_text(value: &str) -> bool {
         .any(|needle| normalized.eq_ignore_ascii_case(needle))
 }
 
+/// True when `text` is nothing but complete `<tag>...</tag>` blocks for the
+/// given tag names, with only whitespace between them. Agents wrap injected
+/// context and command output this way; text that merely starts with such a
+/// tag, or has anything around the blocks, was written by a person.
+pub fn consists_of_tag_blocks(text: &str, tags: &[&str]) -> bool {
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        return false;
+    }
+    while !rest.is_empty() {
+        let Some(tag) = tags
+            .iter()
+            .find(|tag| rest.starts_with(&format!("<{tag}>")))
+        else {
+            return false;
+        };
+        let close = format!("</{tag}>");
+        let Some(end) = rest.find(&close) else {
+            return false;
+        };
+        rest = rest[end + close.len()..].trim_start();
+    }
+    true
+}
+
 pub fn snippet_from_match(value: &str, query: &str, max_len: usize) -> String {
     let compact = compact_whitespace(value);
     if compact.is_empty() {
@@ -290,13 +315,15 @@ pub fn highlight_matches(value: &str, query: &str) -> String {
     let stopwords = [
         "a", "an", "and", "are", "as", "at", "based", "be", "but", "by", "can", "check", "do",
         "double", "for", "from", "has", "have", "how", "i", "in", "into", "is", "it", "made",
-        "not", "of", "on", "or", "please", "some", "that", "the", "this", "to", "update",
-        "what", "with", "you", "your",
+        "not", "of", "on", "or", "please", "some", "that", "the", "this", "to", "update", "what",
+        "with", "you", "your",
     ];
     for token in trimmed.split_whitespace() {
         if token.len() >= 3
             && !stopwords.contains(&token.to_ascii_lowercase().as_str())
-            && !terms.iter().any(|existing| existing.eq_ignore_ascii_case(token))
+            && !terms
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(token))
         {
             terms.push(token.to_string());
         }
@@ -326,19 +353,15 @@ pub fn format_transcript_line(role: &str, timestamp: Option<DateTime<Utc>>, text
     format!("[{stamp}] {role}\n{text}")
 }
 
-pub fn minimal_record(
-    provider: Provider,
-    path: &Path,
-    warning: String,
-) -> ParsedSession {
+pub fn minimal_record(provider: Provider, path: &Path, warning: String) -> ParsedSession {
     let provider_session_id = path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("unknown")
         .to_string();
     let parse_version = match provider {
-        Provider::Claude => "claude-v1",
-        Provider::Codex => "codex-v1",
+        Provider::Claude => "claude-v2",
+        Provider::Codex => "codex-v3",
         Provider::Cursor => "cursor-v1",
         Provider::Antigravity => "antigravity-v1",
         Provider::Pi => "pi-v1",
@@ -390,6 +413,12 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
             ));
         }
     };
+    if !Path::new(&session.source_path).exists() {
+        return Err(anyhow!(
+            "can't resume: the transcript file {} no longer exists (the index keeps a searchable copy, but {binary} needs the original)",
+            session.source_path
+        ));
+    }
     if which(binary).is_none() {
         return Err(anyhow!("required binary '{binary}' is not on PATH"));
     }
@@ -413,7 +442,9 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
             "--session".to_string(),
             session.provider_session_id.clone(),
         ],
-        Provider::Cursor | Provider::Antigravity => unreachable!("resume is handled before command construction"),
+        Provider::Cursor | Provider::Antigravity => {
+            unreachable!("resume is handled before command construction")
+        }
     };
     Ok((command, cwd))
 }
@@ -430,6 +461,18 @@ pub fn which(binary: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn resume_plan_explains_deleted_transcripts() {
+        let session = minimal_record(
+            Provider::Claude,
+            Path::new("/nonexistent/sessions/abc.jsonl"),
+            String::new(),
+        )
+        .session;
+        let err = resume_plan(&session).unwrap_err().to_string();
+        assert!(err.contains("no longer exists"), "{err}");
+    }
 
     #[test]
     fn extracts_nested_text() {
@@ -469,10 +512,14 @@ mod tests {
         let worktree_gitdir = main_repo.join(".git").join("worktrees").join("wt");
         let wt_dir = dir.path().join("wt");
         fs::create_dir_all(&main_repo).unwrap();
-        fs::create_dir_all(&main_repo.join(".git")).unwrap();
+        fs::create_dir_all(main_repo.join(".git")).unwrap();
         fs::create_dir_all(&worktree_gitdir).unwrap();
         fs::create_dir_all(&wt_dir).unwrap();
-        fs::write(wt_dir.join(".git"), format!("gitdir: {}", worktree_gitdir.display())).unwrap();
+        fs::write(
+            wt_dir.join(".git"),
+            format!("gitdir: {}", worktree_gitdir.display()),
+        )
+        .unwrap();
         let root = find_repo_root(wt_dir.to_str().unwrap());
         assert_eq!(root.as_deref(), Some(main_repo.to_str().unwrap()));
     }
@@ -483,13 +530,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let super_repo = dir.path().join("superrepo");
         let submodule_dir = super_repo.join("packages").join("foo");
-        let submodule_gitdir = super_repo.join(".git").join("modules").join("packages").join("foo");
+        let submodule_gitdir = super_repo
+            .join(".git")
+            .join("modules")
+            .join("packages")
+            .join("foo");
         fs::create_dir_all(&super_repo).unwrap();
-        fs::create_dir_all(&super_repo.join(".git")).unwrap();
+        fs::create_dir_all(super_repo.join(".git")).unwrap();
         fs::create_dir_all(&submodule_dir).unwrap();
         fs::create_dir_all(&submodule_gitdir).unwrap();
         // Submodule .git file points into <super>/.git/modules/...
-        fs::write(submodule_dir.join(".git"), format!("gitdir: {}", submodule_gitdir.display())).unwrap();
+        fs::write(
+            submodule_dir.join(".git"),
+            format!("gitdir: {}", submodule_gitdir.display()),
+        )
+        .unwrap();
         // Should resolve to the submodule's own directory (falls through worktree logic)
         // rather than some garbage path 3 levels above the modules entry
         let root = find_repo_root(submodule_dir.to_str().unwrap());

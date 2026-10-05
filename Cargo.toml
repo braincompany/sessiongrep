@@ -2,11 +2,12 @@
 name = "sessiongrep"
 version = "0.1.0"
 edition = "2021"
-description = "Local-first search, inspection, export, and resume for Claude Code, Codex CLI, and Cursor sessions, with an MCP server for agent-driven recall."
+rust-version = "1.88"
+description = "Local-first memory layer for CLI agents: search, inspect, export, and resume Claude Code, Codex CLI, Cursor, Antigravity, and Pi sessions, with an MCP server for agent-driven recall."
 license = "Apache-2.0"
 repository = "https://github.com/braincompany/sessiongrep"
 readme = "README.md"
-keywords = ["cli", "search", "claude", "codex", "cursor"]
+keywords = ["cli", "search", "mcp", "claude-code", "codex"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
@@ -25,6 +26,9 @@ serde_json = "1.0"
 shlex = "1.3"
 thiserror = "2.0"
 toml = "0.9"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [[bin]]
 name = "sessiongrep"

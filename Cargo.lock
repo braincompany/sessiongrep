@@ -1035,6 +1035,7 @@ dependencies = [
  "dirs",
  "fuzzy-matcher",
  "ignore",
+ "libc",
  "ratatui",
  "regex",
  "rusqlite",

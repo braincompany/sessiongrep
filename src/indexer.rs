@@ -74,18 +74,29 @@ pub fn reindex(
             continue;
         }
         let parsed = match source.provider {
-            Provider::Claude => claude.parse(source),
+            Provider::Claude => Some(claude.parse(source)),
             Provider::Codex => codex.parse(source),
-            Provider::Cursor => cursor.parse(source),
-            Provider::Antigravity => antigravity.parse(source),
-            Provider::Pi => pi.parse(source),
+            Provider::Cursor => Some(cursor.parse(source)),
+            Provider::Antigravity => Some(antigravity.parse(source)),
+            Provider::Pi => Some(pi.parse(source)),
         };
-        db.upsert_session(
-            &parsed,
-            source.mtime_ns,
-            source.size_bytes,
-            content_hash.as_deref(),
-        )?;
+        match parsed {
+            Some(parsed) => db.upsert_session(
+                &parsed,
+                source.mtime_ns,
+                source.size_bytes,
+                content_hash.as_deref(),
+            )?,
+            // Adapters skip files that aren't standalone sessions. Remember the file
+            // so it isn't re-read every run, and drop anything indexed from it before.
+            None => db.exclude_source(
+                source.provider,
+                &source_path,
+                source.mtime_ns,
+                source.size_bytes,
+                content_hash.as_deref(),
+            )?,
+        }
         updated += 1;
         if let Some(cb) = progress.as_deref_mut() {
             cb(i + 1, total, updated);

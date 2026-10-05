@@ -1,5 +1,5 @@
 {
-  description = "Local-first search, inspection, export, and resume for Claude Code, Codex CLI, and Cursor sessions, with an MCP server for agent-driven recall.";
+  description = "Local-first memory layer for CLI agents: search, inspect, export, and resume Claude Code, Codex CLI, Cursor, Antigravity, and Pi sessions, with an MCP server for agent-driven recall.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
