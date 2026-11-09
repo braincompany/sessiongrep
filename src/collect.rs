@@ -17,6 +17,22 @@ use serde_json::{json, Value};
 
 use crate::models::Provider;
 
+/// Output file name for a session. The ID comes from file contents, so anything
+/// outside `[A-Za-z0-9_-]` (path separators, dots) becomes `_`.
+pub fn output_file_name(provider: Provider, session_id: &str) -> String {
+    let id: String = session_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{provider}-{id}.jsonl")
+}
+
 pub fn collect_file(
     provider: Provider,
     session_id: &str,
@@ -254,5 +270,16 @@ mod tests {
         assert_eq!(value["api_key"], REDACTED);
         assert_eq!(value["note"], "a1b2c3d4e5f6g7h8i9j0");
         assert_eq!(value["token"], "short");
+    }
+
+    #[test]
+    fn output_file_name_cannot_escape_directory() {
+        let name = output_file_name(Provider::Codex, "../../etc/passwd");
+        assert_eq!(name, "codex-______etc_passwd.jsonl");
+        assert!(!name.contains('/') && !name.contains(".."));
+        assert_eq!(
+            output_file_name(Provider::Claude, "79ac-1_b"),
+            "claude-79ac-1_b.jsonl"
+        );
     }
 }

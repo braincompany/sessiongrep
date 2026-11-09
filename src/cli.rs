@@ -311,9 +311,9 @@ fn collect(config: &Config, db: &Db, args: &CollectArgs) -> Result<()> {
     fs::create_dir_all(&args.output)?;
     let mut records = 0;
     for session in &sessions {
-        let path = args.output.join(format!(
-            "{}-{}.jsonl",
-            session.provider, session.provider_session_id
+        let path = args.output.join(collect::output_file_name(
+            session.provider,
+            &session.provider_session_id,
         ));
         let source = std::path::Path::new(&session.source_path);
         if !source.exists() {
