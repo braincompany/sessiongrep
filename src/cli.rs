@@ -251,14 +251,37 @@ fn collect(config: &Config, db: &Db, args: &CollectArgs) -> Result<()> {
     let mut sessions = if args.sessions.is_empty() {
         let mut filters = build_filters(&args.filters, config)?;
         filters.limit = args.filters.limit.unwrap_or(10_000);
-        db.list_recent(&filters)?
+        // Filter by provider in the query so --limit counts only collectable sessions.
+        let mut found = Vec::new();
+        let enabled = [
+            (Provider::Claude, config.providers.claude.enabled),
+            (Provider::Codex, config.providers.codex.enabled),
+        ];
+        for (provider, enabled) in enabled {
+            if enabled
+                && args
+                    .filters
+                    .provider
+                    .is_none_or(|wanted| wanted == provider)
+            {
+                filters.provider = Some(provider);
+                found.extend(db.list_recent(&filters)?);
+            }
+        }
+        found.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
+        found.truncate(filters.limit);
+        found
     } else {
         args.sessions
             .iter()
             .map(|id| db.resolve_session(id).map(|found| found.session))
             .collect::<Result<_>>()?
     };
-    sessions.retain(|session| matches!(session.provider, Provider::Claude | Provider::Codex));
+    sessions.retain(|session| match session.provider {
+        Provider::Claude => config.providers.claude.enabled,
+        Provider::Codex => config.providers.codex.enabled,
+        _ => false,
+    });
     if sessions.is_empty() {
         println!("no Claude or Codex sessions matched");
         return Ok(());
@@ -296,6 +319,12 @@ fn collect(config: &Config, db: &Db, args: &CollectArgs) -> Result<()> {
         if !source.exists() {
             eprintln!("skipped {}: source file is gone", session.id);
             continue;
+        }
+        if fs::canonicalize(&path).is_ok_and(|dest| Some(dest) == fs::canonicalize(source).ok()) {
+            return Err(anyhow!(
+                "output file {} is the session's own source file",
+                path.display()
+            ));
         }
         let mut out = std::io::BufWriter::new(fs::File::create(&path)?);
         records += collect::collect_file(

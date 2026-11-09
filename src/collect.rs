@@ -87,13 +87,33 @@ static SECRET_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid regex")
 });
 
+/// JSON field names that hold secrets, e.g. `{"api_key": "..."}`.
+static SECRET_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)api[_-]?key|secret|token|passw(?:or)?d|access[_-]?key").expect("valid regex")
+});
+
 const REDACTED: &str = "[REDACTED]";
+
+fn looks_random(value: &str) -> bool {
+    value.len() >= 16
+        && value.chars().any(|c| c.is_ascii_digit())
+        && value.chars().any(|c| c.is_ascii_alphabetic())
+}
 
 fn redact(value: &mut Value) {
     match value {
         Value::String(text) => *text = redact_text(text),
         Value::Array(items) => items.iter_mut().for_each(redact),
-        Value::Object(map) => map.values_mut().for_each(redact),
+        Value::Object(map) => {
+            for (key, value) in map.iter_mut() {
+                match value {
+                    Value::String(text) if SECRET_KEY.is_match(key) && looks_random(text) => {
+                        *text = REDACTED.to_string();
+                    }
+                    _ => redact(value),
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -102,10 +122,7 @@ fn redact_text(text: &str) -> String {
     let text = SECRET_PATTERNS.replace_all(text, REDACTED);
     SECRET_ASSIGNMENT
         .replace_all(&text, |caps: &Captures| {
-            let value = &caps[2];
-            let random = value.chars().any(|c| c.is_ascii_digit())
-                && value.chars().any(|c| c.is_ascii_alphabetic());
-            if random {
+            if looks_random(&caps[2]) {
                 format!("{}{REDACTED}", &caps[1])
             } else {
                 caps[0].to_string()
@@ -228,5 +245,14 @@ mod tests {
         assert!(!redacted.contains("ghp_"));
         assert!(redacted.contains("API_KEY=[REDACTED]"));
         assert!(redacted.contains("let token = next_token_value();"));
+    }
+
+    #[test]
+    fn json_secret_fields_redacted_by_key_name() {
+        let mut value = json!({"api_key": "a1b2c3d4e5f6g7h8i9j0", "note": "a1b2c3d4e5f6g7h8i9j0", "token": "short"});
+        redact(&mut value);
+        assert_eq!(value["api_key"], REDACTED);
+        assert_eq!(value["note"], "a1b2c3d4e5f6g7h8i9j0");
+        assert_eq!(value["token"], "short");
     }
 }
