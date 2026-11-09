@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -9,6 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
 use crate::tui;
+use sessiongrep::collect;
 use sessiongrep::config::Config;
 use sessiongrep::db::Db;
 use sessiongrep::indexer;
@@ -59,6 +60,8 @@ enum Commands {
     Resume(ResumeArgs),
     /// Export a session as markdown, text, or JSON
     Export(ExportArgs),
+    /// Dump full sessions (content, tool calls, model, token usage) as JSONL
+    Collect(CollectArgs),
     /// Check provider paths, CLIs, and index health
     Doctor,
     /// Print the config, index, and provider paths in use
@@ -121,6 +124,24 @@ struct ResumeArgs {
     /// Print the resume command without running it
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct CollectArgs {
+    /// Directory to write one JSONL file per session into
+    #[arg(short, long)]
+    output: PathBuf,
+    /// Only this session (ID or unique prefix); repeat to pick several
+    #[arg(long = "session")]
+    sessions: Vec<String>,
+    #[command(flatten)]
+    filters: QueryArgs,
+    /// List the sessions that would be collected, then stop
+    #[arg(long)]
+    dry_run: bool,
+    /// Skip the confirmation prompt
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -217,11 +238,108 @@ pub fn run() -> Result<()> {
                 print!("{output}");
             }
         }
+        Commands::Collect(args) => collect(&config, &db, &args)?,
         Commands::Doctor => print_doctor(&config, &db)?,
         Commands::Paths => print_paths(&config),
         Commands::Tui => tui::run(&config, &db)?,
     }
 
+    Ok(())
+}
+
+fn collect(config: &Config, db: &Db, args: &CollectArgs) -> Result<()> {
+    let mut sessions = if args.sessions.is_empty() {
+        let mut filters = build_filters(&args.filters, config)?;
+        filters.limit = args.filters.limit.unwrap_or(10_000);
+        // Filter by provider in the query so --limit counts only collectable sessions.
+        let mut found = Vec::new();
+        let enabled = [
+            (Provider::Claude, config.providers.claude.enabled),
+            (Provider::Codex, config.providers.codex.enabled),
+        ];
+        for (provider, enabled) in enabled {
+            if enabled
+                && args
+                    .filters
+                    .provider
+                    .is_none_or(|wanted| wanted == provider)
+            {
+                filters.provider = Some(provider);
+                found.extend(db.list_recent(&filters)?);
+            }
+        }
+        found.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
+        found.truncate(filters.limit);
+        found
+    } else {
+        args.sessions
+            .iter()
+            .map(|id| db.resolve_session(id).map(|found| found.session))
+            .collect::<Result<_>>()?
+    };
+    sessions.retain(|session| match session.provider {
+        Provider::Claude => config.providers.claude.enabled,
+        Provider::Codex => config.providers.codex.enabled,
+        _ => false,
+    });
+    if sessions.is_empty() {
+        println!("no Claude or Codex sessions matched");
+        return Ok(());
+    }
+    print_sessions(&sessions);
+    if args.dry_run {
+        return Ok(());
+    }
+    let prompt = format!(
+        "\nCollect {} sessions into {}? This copies full content, including tool output. \
+         Common secrets are redacted, but review the files before sharing them.",
+        sessions.len(),
+        args.output.display()
+    );
+    if !args.yes {
+        if !std::io::stdin().is_terminal() {
+            return Err(anyhow!(
+                "refusing to collect without confirmation; pass --yes"
+            ));
+        }
+        if !prompt_confirm(&prompt)? {
+            println!("collect cancelled");
+            return Ok(());
+        }
+    }
+
+    fs::create_dir_all(&args.output)?;
+    let mut records = 0;
+    for session in &sessions {
+        let path = args.output.join(collect::output_file_name(
+            session.provider,
+            &session.provider_session_id,
+        ));
+        let source = std::path::Path::new(&session.source_path);
+        if !source.exists() {
+            eprintln!("skipped {}: source file is gone", session.id);
+            continue;
+        }
+        if fs::canonicalize(&path).is_ok_and(|dest| Some(dest) == fs::canonicalize(source).ok()) {
+            return Err(anyhow!(
+                "output file {} is the session's own source file",
+                path.display()
+            ));
+        }
+        let mut out = std::io::BufWriter::new(fs::File::create(&path)?);
+        records += collect::collect_file(
+            session.provider,
+            &session.provider_session_id,
+            source,
+            &mut out,
+        )?;
+        out.flush()?;
+    }
+    println!(
+        "collected {records} records from {} sessions into {}",
+        sessions.len(),
+        args.output.display()
+    );
     Ok(())
 }
 
