@@ -2,59 +2,116 @@
 //!
 //! One record per transcript line. `raw` is the untouched line (prompts, replies,
 //! tool calls, tool output). `model` and `usage` are lifted out so cost analysis
-//! needs no provider-specific parsing.
+//! needs no provider-specific parsing. Strings in `raw` pass through
+//! best-effort secret redaction.
 
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
+use std::path::Path;
+use std::sync::LazyLock;
 
 use anyhow::Result;
+use regex::{Captures, Regex};
 use serde_json::{json, Value};
 
-use crate::models::{Provider, SourceFile};
+use crate::models::Provider;
 
-pub fn collect_file(source: &SourceFile, out: &mut impl Write) -> Result<usize> {
-    let raw = fs::read_to_string(&source.path)?;
+pub fn collect_file(
+    provider: Provider,
+    session_id: &str,
+    path: &Path,
+    out: &mut impl Write,
+) -> Result<usize> {
+    let raw = fs::read_to_string(path)?;
     let lines: Vec<Value> = raw
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect();
-    let session_id = source
-        .path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("unknown");
-    let last_usage = last_usage_by_message(source.provider, &lines);
+    let last_usage = last_usage_by_message(provider, &lines);
     let mut model: Option<String> = None;
     let mut cwd: Option<String> = None;
 
     for (seq, line) in lines.iter().enumerate() {
-        if let Some(found) = model_of(source.provider, line) {
+        if let Some(found) = model_of(provider, line) {
             model = Some(found);
         }
         cwd = cwd.or_else(|| cwd_of(line));
-        let usage = match source.provider {
+        let usage = match provider {
             Provider::Claude => {
                 claude_usage(line).filter(|_| last_usage.get(&message_id(line)) == Some(&seq))
             }
             Provider::Codex => codex_usage(line),
             _ => None,
         };
+        let mut raw = line.clone();
+        redact(&mut raw);
         let record = json!({
-            "provider": source.provider,
+            "provider": provider,
             "session_id": session_id,
-            "source_path": source.path,
+            "source_path": path,
             "cwd": cwd,
             "seq": seq,
             "timestamp": line.get("timestamp"),
             "model": model,
             "usage": usage,
-            "raw": line,
+            "raw": raw,
         });
         serde_json::to_writer(&mut *out, &record)?;
         out.write_all(b"\n")?;
     }
     Ok(lines.len())
+}
+
+/// Known token formats, replaced outright.
+static SECRET_PATTERNS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+        r"|\bAKIA[0-9A-Z]{16}\b",
+        r"|\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})",
+        r"|\bsk-[A-Za-z0-9_-]{20,}",
+        r"|\bxox[abprs]-[A-Za-z0-9-]{10,}",
+        r"|\bAIza[0-9A-Za-z_-]{35}",
+        r"|\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+        r"|(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{20,}",
+    ))
+    .expect("valid regex")
+});
+
+/// `NAME_SECRET=value` style assignments. The value is only redacted when it
+/// looks random (long, letters and digits), so code like `token = next()` survives.
+static SECRET_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)([\w-]*(?:api[_-]?key|secret|token|passw(?:or)?d|access[_-]?key)[\w-]*["']?\s*[:=]\s*["']?)([A-Za-z0-9_\-./+=]{16,})"#,
+    )
+    .expect("valid regex")
+});
+
+const REDACTED: &str = "[REDACTED]";
+
+fn redact(value: &mut Value) {
+    match value {
+        Value::String(text) => *text = redact_text(text),
+        Value::Array(items) => items.iter_mut().for_each(redact),
+        Value::Object(map) => map.values_mut().for_each(redact),
+        _ => {}
+    }
+}
+
+fn redact_text(text: &str) -> String {
+    let text = SECRET_PATTERNS.replace_all(text, REDACTED);
+    SECRET_ASSIGNMENT
+        .replace_all(&text, |caps: &Captures| {
+            let value = &caps[2];
+            let random = value.chars().any(|c| c.is_ascii_digit())
+                && value.chars().any(|c| c.is_ascii_alphabetic());
+            if random {
+                format!("{}{REDACTED}", &caps[1])
+            } else {
+                caps[0].to_string()
+            }
+        })
+        .into_owned()
 }
 
 fn message_id(line: &Value) -> String {
@@ -129,20 +186,13 @@ fn codex_usage(line: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn run(provider: Provider, body: &str) -> Vec<Value> {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("abc.jsonl");
         fs::write(&path, body).unwrap();
-        let source = SourceFile {
-            provider,
-            path: PathBuf::from(&path),
-            mtime_ns: 0,
-            size_bytes: 0,
-        };
         let mut out = Vec::new();
-        collect_file(&source, &mut out).unwrap();
+        collect_file(provider, "abc", &path, &mut out).unwrap();
         String::from_utf8(out)
             .unwrap()
             .lines()
@@ -169,5 +219,14 @@ mod tests {
         assert_eq!(records[1]["usage"]["input"], 20);
         assert_eq!(records[1]["usage"]["cache_read"], 80);
         assert_eq!(records[1]["model"], "gpt-x");
+    }
+
+    #[test]
+    fn secrets_redacted_but_code_kept() {
+        let text = "key ghp_abcdefghijklmnopqrstuvwxyz0123456789 and\nAPI_KEY=a1b2c3d4e5f6g7h8i9j0\nlet token = next_token_value();";
+        let redacted = redact_text(text);
+        assert!(!redacted.contains("ghp_"));
+        assert!(redacted.contains("API_KEY=[REDACTED]"));
+        assert!(redacted.contains("let token = next_token_value();"));
     }
 }

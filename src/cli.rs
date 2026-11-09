@@ -128,15 +128,20 @@ struct ResumeArgs {
 
 #[derive(Debug, Args)]
 struct CollectArgs {
-    /// Only sessions from this tool (claude or codex)
-    #[arg(long, value_parser = PossibleValuesParser::new(["claude", "codex"]))]
-    provider: Option<String>,
-    /// Only session files modified on or after this date (YYYY-MM-DD or RFC 3339)
-    #[arg(long)]
-    since: Option<String>,
-    /// Write to this file instead of stdout
+    /// Directory to write one JSONL file per session into
     #[arg(short, long)]
-    output: Option<PathBuf>,
+    output: PathBuf,
+    /// Only this session (ID or unique prefix); repeat to pick several
+    #[arg(long = "session")]
+    sessions: Vec<String>,
+    #[command(flatten)]
+    filters: QueryArgs,
+    /// List the sessions that would be collected, then stop
+    #[arg(long)]
+    dry_run: bool,
+    /// Skip the confirmation prompt
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -162,10 +167,7 @@ pub fn run() -> Result<()> {
     let db = Db::open(&config.db_path())?;
 
     // Auto-reindex (incremental) before commands that read session data
-    if !matches!(
-        cli.command,
-        Commands::Reindex(_) | Commands::Paths | Commands::Collect(_)
-    ) {
+    if !matches!(cli.command, Commands::Reindex(_) | Commands::Paths) {
         reindex(&config, &db, false, true)?;
     }
 
@@ -236,7 +238,7 @@ pub fn run() -> Result<()> {
                 print!("{output}");
             }
         }
-        Commands::Collect(args) => collect(&config, &args)?,
+        Commands::Collect(args) => collect(&config, &db, &args)?,
         Commands::Doctor => print_doctor(&config, &db)?,
         Commands::Paths => print_paths(&config),
         Commands::Tui => tui::run(&config, &db)?,
@@ -245,40 +247,65 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn collect(config: &Config, args: &CollectArgs) -> Result<()> {
-    let since = args
-        .since
-        .as_deref()
-        .map(parse_datetime)
-        .map(|d| d.ok_or_else(|| anyhow!("--since must be YYYY-MM-DD or RFC 3339")));
-    let since_ns = match since {
-        Some(parsed) => parsed?.timestamp_nanos_opt().unwrap_or_default(),
-        None => i64::MIN,
+fn collect(config: &Config, db: &Db, args: &CollectArgs) -> Result<()> {
+    let mut sessions = if args.sessions.is_empty() {
+        let mut filters = build_filters(&args.filters, config)?;
+        filters.limit = args.filters.limit.unwrap_or(10_000);
+        db.list_recent(&filters)?
+    } else {
+        args.sessions
+            .iter()
+            .map(|id| db.resolve_session(id).map(|found| found.session))
+            .collect::<Result<_>>()?
     };
-    let want = |name: &str| args.provider.as_deref().is_none_or(|p| p == name);
-    let mut sources = Vec::new();
-    if want("claude") {
-        sources.extend(ClaudeAdapter::new(config.claude_paths()).discover());
+    sessions.retain(|session| matches!(session.provider, Provider::Claude | Provider::Codex));
+    if sessions.is_empty() {
+        println!("no Claude or Codex sessions matched");
+        return Ok(());
     }
-    if want("codex") {
-        sources.extend(CodexAdapter::new(config.codex_paths(), config.codex_home()).discover());
+    print_sessions(&sessions);
+    if args.dry_run {
+        return Ok(());
     }
-    let mut out: Box<dyn std::io::Write> = match &args.output {
-        Some(path) => Box::new(std::io::BufWriter::new(fs::File::create(path)?)),
-        None => Box::new(std::io::BufWriter::new(std::io::stdout().lock())),
-    };
-    let (mut files, mut records) = (0, 0);
-    for source in sources.iter().filter(|s| s.mtime_ns >= since_ns) {
-        match collect::collect_file(source, &mut out) {
-            Ok(n) => {
-                files += 1;
-                records += n;
-            }
-            Err(err) => eprintln!("skipped {}: {err}", source.path.display()),
+    let prompt = format!(
+        "\nCollect {} sessions into {}? This copies full content, including tool output. \
+         Common secrets are redacted, but review the files before sharing them.",
+        sessions.len(),
+        args.output.display()
+    );
+    if !args.yes {
+        if !std::io::stdin().is_terminal() {
+            return Err(anyhow!(
+                "refusing to collect without confirmation; pass --yes"
+            ));
+        }
+        if !prompt_confirm(&prompt)? {
+            println!("collect cancelled");
+            return Ok(());
         }
     }
-    out.flush()?;
-    eprintln!("collected {records} records from {files} sessions");
+
+    fs::create_dir_all(&args.output)?;
+    let mut records = 0;
+    for session in &sessions {
+        let path = args.output.join(format!(
+            "{}-{}.jsonl",
+            session.provider, session.provider_session_id
+        ));
+        let mut out = std::io::BufWriter::new(fs::File::create(&path)?);
+        records += collect::collect_file(
+            session.provider,
+            &session.provider_session_id,
+            std::path::Path::new(&session.source_path),
+            &mut out,
+        )?;
+        out.flush()?;
+    }
+    println!(
+        "collected {records} records from {} sessions into {}",
+        sessions.len(),
+        args.output.display()
+    );
     Ok(())
 }
 

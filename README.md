@@ -82,6 +82,17 @@ sessiongrep --help                 # every command and flag
 
 Search matches whole words, partial words (`sqli` finds `sqlite`), and small typos in titles and paths, then ranks results by where the match landed, how recent the session is, and whether it belongs to the repo you're in.
 
+## Collect sessions for research
+
+`collect` copies full Claude and Codex sessions (prompts, replies, tool calls, tool output, model, token usage) into a folder, one JSONL file per session. It runs locally and sends nothing anywhere.
+
+```bash
+sessiongrep collect -o ./sessions --path ~/src/app --dry-run   # see what would be collected
+sessiongrep collect -o ./sessions --session 79accec8           # pick exact sessions (repeatable)
+```
+
+It asks for confirmation before writing. Common secrets (API keys, tokens, private keys) are redacted, but redaction is best-effort: review the files before you share them.
+
 ## MCP server setup
 
 The MCP server lets AI agents search and retrieve your past sessions programmatically — no copy-pasting context from old conversations.
