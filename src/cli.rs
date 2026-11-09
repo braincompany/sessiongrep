@@ -292,11 +292,16 @@ fn collect(config: &Config, db: &Db, args: &CollectArgs) -> Result<()> {
             "{}-{}.jsonl",
             session.provider, session.provider_session_id
         ));
+        let source = std::path::Path::new(&session.source_path);
+        if !source.exists() {
+            eprintln!("skipped {}: source file is gone", session.id);
+            continue;
+        }
         let mut out = std::io::BufWriter::new(fs::File::create(&path)?);
         records += collect::collect_file(
             session.provider,
             &session.provider_session_id,
-            std::path::Path::new(&session.source_path),
+            source,
             &mut out,
         )?;
         out.flush()?;
