@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -9,6 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
 use crate::tui;
+use sessiongrep::collect;
 use sessiongrep::config::Config;
 use sessiongrep::db::Db;
 use sessiongrep::indexer;
@@ -59,6 +60,8 @@ enum Commands {
     Resume(ResumeArgs),
     /// Export a session as markdown, text, or JSON
     Export(ExportArgs),
+    /// Dump full sessions (content, tool calls, model, token usage) as JSONL
+    Collect(CollectArgs),
     /// Check provider paths, CLIs, and index health
     Doctor,
     /// Print the config, index, and provider paths in use
@@ -124,6 +127,19 @@ struct ResumeArgs {
 }
 
 #[derive(Debug, Args)]
+struct CollectArgs {
+    /// Only sessions from this tool (claude or codex)
+    #[arg(long, value_parser = PossibleValuesParser::new(["claude", "codex"]))]
+    provider: Option<String>,
+    /// Only session files modified on or after this date (YYYY-MM-DD or RFC 3339)
+    #[arg(long)]
+    since: Option<String>,
+    /// Write to this file instead of stdout
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 struct ExportArgs {
     /// Session ID or unique prefix
     id: String,
@@ -146,7 +162,10 @@ pub fn run() -> Result<()> {
     let db = Db::open(&config.db_path())?;
 
     // Auto-reindex (incremental) before commands that read session data
-    if !matches!(cli.command, Commands::Reindex(_) | Commands::Paths) {
+    if !matches!(
+        cli.command,
+        Commands::Reindex(_) | Commands::Paths | Commands::Collect(_)
+    ) {
         reindex(&config, &db, false, true)?;
     }
 
@@ -217,11 +236,49 @@ pub fn run() -> Result<()> {
                 print!("{output}");
             }
         }
+        Commands::Collect(args) => collect(&config, &args)?,
         Commands::Doctor => print_doctor(&config, &db)?,
         Commands::Paths => print_paths(&config),
         Commands::Tui => tui::run(&config, &db)?,
     }
 
+    Ok(())
+}
+
+fn collect(config: &Config, args: &CollectArgs) -> Result<()> {
+    let since = args
+        .since
+        .as_deref()
+        .map(parse_datetime)
+        .map(|d| d.ok_or_else(|| anyhow!("--since must be YYYY-MM-DD or RFC 3339")));
+    let since_ns = match since {
+        Some(parsed) => parsed?.timestamp_nanos_opt().unwrap_or_default(),
+        None => i64::MIN,
+    };
+    let want = |name: &str| args.provider.as_deref().is_none_or(|p| p == name);
+    let mut sources = Vec::new();
+    if want("claude") {
+        sources.extend(ClaudeAdapter::new(config.claude_paths()).discover());
+    }
+    if want("codex") {
+        sources.extend(CodexAdapter::new(config.codex_paths(), config.codex_home()).discover());
+    }
+    let mut out: Box<dyn std::io::Write> = match &args.output {
+        Some(path) => Box::new(std::io::BufWriter::new(fs::File::create(path)?)),
+        None => Box::new(std::io::BufWriter::new(std::io::stdout().lock())),
+    };
+    let (mut files, mut records) = (0, 0);
+    for source in sources.iter().filter(|s| s.mtime_ns >= since_ns) {
+        match collect::collect_file(source, &mut out) {
+            Ok(n) => {
+                files += 1;
+                records += n;
+            }
+            Err(err) => eprintln!("skipped {}: {err}", source.path.display()),
+        }
+    }
+    out.flush()?;
+    eprintln!("collected {records} records from {files} sessions");
     Ok(())
 }
 
